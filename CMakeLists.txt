@@ -41,11 +41,12 @@ endif()
 
 # Text tokenizer library
 add_library(text_tokenizer STATIC
-    src/text_tokenizer.cpp
-    src/gguf_loader.cpp
+    src/core/text_tokenizer.cpp
+    src/core/gguf_loader.cpp
 )
 target_include_directories(text_tokenizer PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${GGML_DIR}/include
 )
 target_link_directories(text_tokenizer PUBLIC
@@ -64,21 +65,22 @@ endif()
 
 # TTS Transformer library (GGML-based + optional CoreML bridge)
 set(TTS_TRANSFORMER_SOURCES
-    src/gguf_loader.cpp
-    src/tts_transformer.cpp
+    src/core/gguf_loader.cpp
+    src/core/tts_transformer.cpp
 )
 if(APPLE AND QWEN3_TTS_COREML)
-    list(APPEND TTS_TRANSFORMER_SOURCES src/coreml_code_predictor.mm)
-    set_source_files_properties(src/coreml_code_predictor.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    list(APPEND TTS_TRANSFORMER_SOURCES src/core/coreml_code_predictor.mm)
+    set_source_files_properties(src/core/coreml_code_predictor.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 else()
-    list(APPEND TTS_TRANSFORMER_SOURCES src/coreml_code_predictor_stub.cpp)
+    list(APPEND TTS_TRANSFORMER_SOURCES src/core/coreml_code_predictor_stub.cpp)
 endif()
 
 add_library(tts_transformer STATIC
     ${TTS_TRANSFORMER_SOURCES}
 )
 target_include_directories(tts_transformer PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${GGML_DIR}/include
 )
 target_link_directories(tts_transformer PUBLIC
@@ -103,11 +105,13 @@ endif()
 
 # Audio tokenizer encoder library (GGML-based)
 add_library(audio_tokenizer_encoder STATIC
-    src/audio_tokenizer_encoder.cpp
-    src/gguf_loader.cpp
+    src/audio/audio_tokenizer_encoder.cpp
+    src/core/gguf_loader.cpp
 )
 target_include_directories(audio_tokenizer_encoder PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${GGML_DIR}/include
 )
 target_link_directories(audio_tokenizer_encoder PUBLIC
@@ -126,11 +130,13 @@ endif()
 
 # Audio tokenizer decoder library (GGML-based)
 add_library(audio_tokenizer_decoder STATIC
-    src/audio_tokenizer_decoder.cpp
-    src/gguf_loader.cpp
+    src/audio/audio_tokenizer_decoder.cpp
+    src/core/gguf_loader.cpp
 )
 target_include_directories(audio_tokenizer_decoder PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${GGML_DIR}/include
 )
 target_link_directories(audio_tokenizer_decoder PUBLIC
@@ -152,7 +158,9 @@ add_library(qwen3_tts STATIC
     src/qwen3_tts.cpp
 )
 target_include_directories(qwen3_tts PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
     ${GGML_DIR}/include
 )
 target_link_libraries(qwen3_tts PUBLIC
@@ -165,7 +173,7 @@ target_link_libraries(qwen3_tts PUBLIC
 
 # Shared library with C API (for Nim FFI)
 add_library(qwen3tts_shared SHARED
-    src/qwen3tts_c_api.cpp
+    src/api/qwen3tts_c_api.cpp
 )
 set_target_properties(qwen3tts_shared PROPERTIES
     OUTPUT_NAME "qwen3tts"
@@ -173,7 +181,9 @@ set_target_properties(qwen3tts_shared PROPERTIES
     SOVERSION 0
 )
 target_include_directories(qwen3tts_shared PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/audio
 )
 target_link_libraries(qwen3tts_shared PRIVATE
     qwen3_tts
@@ -181,7 +191,7 @@ target_link_libraries(qwen3tts_shared PRIVATE
 
 # CLI executable
 add_executable(qwen3-tts-cli
-    src/main.cpp
+    src/app/main.cpp
 )
 target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
@@ -230,14 +240,8 @@ install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tok
     RUNTIME DESTINATION bin
 )
 install(FILES
-    src/gguf_loader.h
-    src/text_tokenizer.h
-    src/tts_transformer.h
-    src/coreml_code_predictor.h
-    src/audio_tokenizer_encoder.h
-    src/audio_tokenizer_decoder.h
-    src/qwen3_tts.h
-    src/qwen3tts_c_api.h
+    include/qwen3_tts.h
+    include/qwen3tts_c_api.h
     DESTINATION include
 )
 

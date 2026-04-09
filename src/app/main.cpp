@@ -29,7 +29,7 @@ void print_usage(const char * program) {
 int main(int argc, char ** argv) {
     std::string model_dir;
     std::string text;
-    std::string output_file = "output.wav";
+    std::string output_file = "";
     std::string reference_audio;
     
     qwen3_tts::tts_params params;

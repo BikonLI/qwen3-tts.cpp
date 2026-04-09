@@ -1,0 +1,207 @@
+{
+  "model_path": "/Users/andyye/dev/qwen3-tts.cpp/models/Qwen3-TTS-12Hz-0.6B-Base",
+  "reference_audio": "/Users/andyye/dev/qwen3-tts.cpp/clone.wav",
+  "reference_text": "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+  "synthesis_text": "Hello.",
+  "language": "English",
+  "dtype": "float32",
+  "device": "cpu",
+  "x_vector_only_mode": true,
+  "non_streaming_mode": false,
+  "generation": {
+    "max_new_tokens": 64,
+    "do_sample": false,
+    "subtalker_dosample": false,
+    "top_k": null,
+    "top_p": null,
+    "temperature": null,
+    "subtalker_top_k": null,
+    "subtalker_top_p": null,
+    "subtalker_temperature": null
+  },
+  "token_ids": {
+    "tts_bos_token_id": 151672,
+    "tts_eos_token_id": 151673,
+    "tts_pad_token_id": 151671,
+    "codec_bos_id": 2149,
+    "codec_eos_token_id": 2150,
+    "codec_pad_id": 2148,
+    "codec_think_id": 2154,
+    "codec_think_bos_id": 2156,
+    "codec_think_eos_id": 2157,
+    "language_id": 2050
+  },
+  "shapes": {
+    "input_ids": [
+      1,
+      10
+    ],
+    "speaker_embedding": [
+      1024
+    ],
+    "prefill_embedding": [
+      1,
+      10,
+      1024
+    ],
+    "trailing_text_hidden": [
+      1,
+      2,
+      1024
+    ],
+    "tts_pad_embed": [
+      1,
+      1,
+      1024
+    ],
+    "speech_codes": [
+      63,
+      16
+    ],
+    "hidden_states": [
+      63,
+      1024
+    ],
+    "first_frame_logits": [
+      1,
+      3072
+    ],
+    "decoded_audio": [
+      120960
+    ]
+  },
+  "outputs": {
+    "det_text_tokens.bin": {
+      "path": "det_text_tokens.bin",
+      "shape": [
+        1,
+        10
+      ],
+      "dtype": "int64",
+      "size_bytes": 80,
+      "sha256": "e474aaf2b4f77ae954b12bd11a4df3421c10002c3a769015c14bf15ec4818d69"
+    },
+    "det_speaker_embedding.bin": {
+      "path": "det_speaker_embedding.bin",
+      "shape": [
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 4096,
+      "sha256": "61b45d744253a62f1f6e7fa804cf95b1c043568a13e96663bbb15b5eebc9e610"
+    },
+    "det_prefill_embedding.bin": {
+      "path": "det_prefill_embedding.bin",
+      "shape": [
+        1,
+        10,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 40960,
+      "sha256": "4b76b0af54ffe7edb476d0e2ce97408e730446579033d28f60232264584222fc"
+    },
+    "det_speech_codes.bin": {
+      "path": "det_speech_codes.bin",
+      "shape": [
+        63,
+        16
+      ],
+      "dtype": "int64",
+      "size_bytes": 8064,
+      "sha256": "f0a9f60c562c2d928335307bde7b5350a39032f6d3c4b942db3b1b36f7d81d9e"
+    },
+    "det_hidden_states.bin": {
+      "path": "det_hidden_states.bin",
+      "shape": [
+        63,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 258048,
+      "sha256": "8bc3b19d786d084299d730ae150f87dd61eba99fef23ad2c76cb8d53c302a2fc"
+    },
+    "det_first_frame_logits.bin": {
+      "path": "det_first_frame_logits.bin",
+      "shape": [
+        1,
+        3072
+      ],
+      "dtype": "float32",
+      "size_bytes": 12288,
+      "sha256": "2b7ee95bf2de54288915386f308aa1960b5d2ad14dfc4ea2c507bd80f769ba17"
+    },
+    "det_decoded_audio.bin": {
+      "path": "det_decoded_audio.bin",
+      "shape": [
+        120960
+      ],
+      "dtype": "float32",
+      "size_bytes": 483840,
+      "sha256": "272629dfd827d37068aede054c1c3ecb81126c199bdcdd4f5ef0f3301a340c87"
+    },
+    "det_trailing_text.bin": {
+      "path": "det_trailing_text.bin",
+      "shape": [
+        1,
+        2,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 8192,
+      "sha256": "0be99c99c0607ed5c53a0a00053d3f1bc79c11c5a7147ef494d19942a493a1e7"
+    },
+    "det_tts_pad_embed.bin": {
+      "path": "det_tts_pad_embed.bin",
+      "shape": [
+        1,
+        1,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 4096,
+      "sha256": "0289fcdb42b3c45e829204dd7de66fd40e1453c00bbce21b3eb866a84d9090df"
+    },
+    "det_role_embed.bin": {
+      "path": "det_role_embed.bin",
+      "shape": [
+        1,
+        3,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 12288,
+      "sha256": "a86c059b76c30723e14c1db6af475d19f38e0af62256f9e7da2bbb35a4e53d14"
+    },
+    "det_codec_prefill_embed.bin": {
+      "path": "det_codec_prefill_embed.bin",
+      "shape": [
+        1,
+        6,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 24576,
+      "sha256": "a500ed897cf2c50f35371bde2d77591dbf188b1887a9273cdc6c14d8756b1be5"
+    },
+    "det_tts_overlay.bin": {
+      "path": "det_tts_overlay.bin",
+      "shape": [
+        1,
+        6,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 24576,
+      "sha256": "807974ed068af06247d7efdf153364637d9d5973bdb6ee9e1a139e3fabe0bab3"
+    }
+  },
+  "wav": {
+    "path": "det_output.wav",
+    "sha256": "18422e7f86adfdffa81dd3fbfa16e7c554c37b648550409697a9007c9fed2e50",
+    "sample_rate": 24000,
+    "num_samples": 120960,
+    "duration_seconds": 5.04
+  },
+  "prefill_token_types": "det_prefill_token_types.json"
+}

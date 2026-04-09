@@ -1,0 +1,69 @@
+{
+  "language": "English",
+  "x_vector_only_mode": true,
+  "non_streaming_mode": false,
+  "prefill_sequence_length": 10,
+  "positions": [
+    {
+      "position": 0,
+      "type": "role_token",
+      "token_id": 151644,
+      "description": "text_projection(<|im_start|>)"
+    },
+    {
+      "position": 1,
+      "type": "role_token",
+      "token_id": 77091,
+      "description": "text_projection(assistant)"
+    },
+    {
+      "position": 2,
+      "type": "role_token",
+      "token_id": 198,
+      "description": "text_projection(newline)"
+    },
+    {
+      "position": 3,
+      "type": "codec_overlay",
+      "token_id": 2154,
+      "description": "tts_pad + codec_embedding(codec_think_id)"
+    },
+    {
+      "position": 4,
+      "type": "codec_overlay",
+      "token_id": 2156,
+      "description": "tts_pad + codec_embedding(codec_think_bos_id)"
+    },
+    {
+      "position": 5,
+      "type": "codec_overlay",
+      "token_id": 2050,
+      "description": "tts_pad + codec_embedding(language_id)"
+    },
+    {
+      "position": 6,
+      "type": "codec_overlay",
+      "token_id": 2157,
+      "description": "tts_pad + codec_embedding(codec_think_eos_id)"
+    },
+    {
+      "position": 7,
+      "type": "speaker_overlay",
+      "token_id": null,
+      "description": "tts_pad + projected_speaker_embedding"
+    },
+    {
+      "position": 8,
+      "type": "codec_overlay",
+      "token_id": 2148,
+      "description": "tts_bos + codec_embedding(codec_pad_id)"
+    },
+    {
+      "position": 9,
+      "type": "text_plus_codec_bos",
+      "token_id": 9707,
+      "codec_token_id": 2149,
+      "description": "text_projection(first_text_token) + codec_embedding(codec_bos_id)"
+    }
+  ]
+}

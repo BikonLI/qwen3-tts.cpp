@@ -1,0 +1,81 @@
+{
+  "model_path": "/Users/andyye/dev/qwen3-tts.cpp/models/Qwen3-TTS-12Hz-0.6B-Base",
+  "ref_audio_path": "/Users/andyye/dev/qwen3-tts.cpp/clone.wav",
+  "ref_text": "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+  "synth_text": "Hello.",
+  "outputs": [
+    {
+      "name": "text_tokens",
+      "path": "text_tokens.bin",
+      "shape": [
+        1,
+        10
+      ],
+      "dtype": "int64",
+      "size_bytes": 80
+    },
+    {
+      "name": "ref_text_tokens",
+      "path": "ref_text_tokens.bin",
+      "shape": [
+        1,
+        35
+      ],
+      "dtype": "int64",
+      "size_bytes": 280
+    },
+    {
+      "name": "ref_audio_embedding",
+      "path": "ref_audio_embedding.bin",
+      "shape": [
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 4096
+    },
+    {
+      "name": "speech_codes",
+      "path": "speech_codes.bin",
+      "shape": [
+        63,
+        16
+      ],
+      "dtype": "int64",
+      "size_bytes": 8064
+    },
+    {
+      "name": "hidden_states",
+      "path": "hidden_states.bin",
+      "shape": [
+        63,
+        1024
+      ],
+      "dtype": "float32",
+      "size_bytes": 258048
+    },
+    {
+      "name": "decoded_audio",
+      "path": "decoded_audio.bin",
+      "shape": [
+        120960
+      ],
+      "dtype": "float32",
+      "size_bytes": 483840,
+      "sample_rate": 24000,
+      "duration_seconds": 5.04
+    },
+    {
+      "name": "output_wav",
+      "path": "output.wav",
+      "sample_rate": 24000,
+      "duration_seconds": 5.04,
+      "format": "WAV PCM float32"
+    }
+  ],
+  "model_info": {
+    "tts_model_type": "base",
+    "tokenizer_type": "qwen3_tts_tokenizer_12hz",
+    "device": "cpu",
+    "dtype": "bfloat16"
+  }
+}

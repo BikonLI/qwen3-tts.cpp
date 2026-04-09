@@ -4,7 +4,7 @@
 #include <cstring>
 #include <string>
 
-void print_usage(const char * program) {
+void print_usage(const char *program) {
     fprintf(stderr, "Usage: %s [options] -m <model_dir> -t <text>\n", program);
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
@@ -26,18 +26,18 @@ void print_usage(const char * program) {
     fprintf(stderr, "  %s -m ./models -t \"Hello!\" -r reference.wav -o cloned.wav\n", program);
 }
 
-int main(int argc, char ** argv) {
+int main(int argc, char **argv) {
     std::string model_dir;
     std::string text;
     std::string output_file = "";
     std::string reference_audio;
-    
+
     qwen3_tts::tts_params params;
-    
+
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        
+
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -53,6 +53,17 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             text = argv[i];
+            // if the text is a path to a file, load the file content as text
+            if (FILE *f = fopen(text.c_str(), "r")) {
+                fseek(f, 0, SEEK_END);
+                size_t size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                std::string file_content(size, '\0');
+                fread(&file_content[0], 1, size, f);
+                fclose(f);
+                text = file_content;
+            }
+
         } else if (arg == "-o" || arg == "--output") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing output file\n");
@@ -101,18 +112,30 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             std::string lang = argv[i];
-            if (lang == "en" || lang == "english")       params.language_id = 2050;
-            else if (lang == "ru" || lang == "russian")  params.language_id = 2069;
-            else if (lang == "zh" || lang == "chinese")  params.language_id = 2055;
-            else if (lang == "ja" || lang == "japanese")  params.language_id = 2058;
-            else if (lang == "ko" || lang == "korean")   params.language_id = 2064;
-            else if (lang == "de" || lang == "german")   params.language_id = 2053;
-            else if (lang == "fr" || lang == "french")   params.language_id = 2061;
-            else if (lang == "es" || lang == "spanish")  params.language_id = 2054;
-            else if (lang == "it" || lang == "italian")  params.language_id = 2070;
-            else if (lang == "pt" || lang == "portuguese") params.language_id = 2071;
+            if (lang == "en" || lang == "english")
+                params.language_id = 2050;
+            else if (lang == "ru" || lang == "russian")
+                params.language_id = 2069;
+            else if (lang == "zh" || lang == "chinese")
+                params.language_id = 2055;
+            else if (lang == "ja" || lang == "japanese")
+                params.language_id = 2058;
+            else if (lang == "ko" || lang == "korean")
+                params.language_id = 2064;
+            else if (lang == "de" || lang == "german")
+                params.language_id = 2053;
+            else if (lang == "fr" || lang == "french")
+                params.language_id = 2061;
+            else if (lang == "es" || lang == "spanish")
+                params.language_id = 2054;
+            else if (lang == "it" || lang == "italian")
+                params.language_id = 2070;
+            else if (lang == "pt" || lang == "portuguese")
+                params.language_id = 2071;
             else {
-                fprintf(stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str());
+                fprintf(
+                    stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str()
+                );
                 return 1;
             }
         } else if (arg == "-j" || arg == "--threads") {
@@ -127,37 +150,37 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-    
+
     // Validate required arguments
     if (model_dir.empty()) {
         fprintf(stderr, "Error: model directory is required\n");
         print_usage(argv[0]);
         return 1;
     }
-    
+
     if (text.empty()) {
         fprintf(stderr, "Error: text is required\n");
         print_usage(argv[0]);
         return 1;
     }
-    
+
     // Initialize TTS
     qwen3_tts::Qwen3TTS tts;
-    
+
     fprintf(stderr, "Loading models from: %s\n", model_dir.c_str());
     if (!tts.load_models(model_dir)) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }
-    
+
     // Set progress callback
     tts.set_progress_callback([](int tokens, int max_tokens) {
         fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
     });
-    
+
     // Generate speech
     qwen3_tts::tts_result result;
-    
+
     if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
         result = tts.synthesize(text, params);
@@ -166,24 +189,27 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());
         result = tts.synthesize_with_voice(text, reference_audio, params);
     }
-    
+
     if (!result.success) {
         fprintf(stderr, "\nError: %s\n", result.error_msg.c_str());
         return 1;
     }
-    
+
     fprintf(stderr, "\n");
-    
+
     // Save output
-    if (!qwen3_tts::save_audio_file(output_file, result.audio, result.sample_rate)) {
-        fprintf(stderr, "Error: failed to save output file: %s\n", output_file.c_str());
-        return 1;
+    if (output_file.empty()) {
+        qwen3_tts::play_audio(result.audio, result.sample_rate);
+    } else {
+        if (!qwen3_tts::save_audio_file(output_file, result.audio, result.sample_rate)) {
+            fprintf(stderr, "Error: failed to save output file: %s\n", output_file.c_str());
+            return 1;
+        }
+
+        fprintf(stderr, "Output saved to: %s\n", output_file.c_str());
+        fprintf(stderr, "Audio duration: %.2f seconds\n", (float)result.audio.size() / result.sample_rate);
     }
-    
-    fprintf(stderr, "Output saved to: %s\n", output_file.c_str());
-    fprintf(stderr, "Audio duration: %.2f seconds\n", 
-            (float)result.audio.size() / result.sample_rate);
-    
+
     // Print timing
     if (params.print_timing) {
         fprintf(stderr, "\nTiming:\n");
@@ -194,6 +220,6 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  Decode:    %6lld ms\n", (long long)result.t_decode_ms);
         fprintf(stderr, "  Total:     %6lld ms\n", (long long)result.t_total_ms);
     }
-    
+
     return 0;
 }

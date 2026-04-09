@@ -1,6 +1,7 @@
 #include "qwen3_tts.h"
 #include "gguf_loader.h"
 
+#include <SDL3/SDL.h>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -820,18 +821,120 @@ namespace qwen3_tts
         return true;
     }
 
-    // Simple audio playback using platform-specific APIs (not implemented here)
+    // Blocking audio playback via SDL3. Returns only after playback has finished.
     bool qwen3_tts::play_audio(const std::vector<float> &samples, int sample_rate)
     {
-#ifdef __APPLE__
-        return false; // Not implemented
-#elif defined(__linux__)
-        return false; // Not implemented
-#else
-        (void)samples;
-        (void)sample_rate;
-        return false; // Not implemented on Windows yet
-#endif
+        if (samples.empty())
+        {
+            return true;
+        }
+        if (sample_rate <= 0)
+        {
+            fprintf(stderr, "ERROR: Invalid sample rate: %d\n", sample_rate);
+            return false;
+        }
+        if (samples.size() > (size_t)INT32_MAX / sizeof(float))
+        {
+            fprintf(stderr, "ERROR: Audio buffer too large for SDL stream\n");
+            return false;
+        }
+
+        const bool audio_was_initialized = (SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0;
+        if (!audio_was_initialized)
+        {
+            if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+            {
+                fprintf(stderr, "ERROR: SDL_InitSubSystem(SDL_INIT_AUDIO) failed: %s\n", SDL_GetError());
+                return false;
+            }
+        }
+
+        SDL_AudioSpec spec = {};
+        spec.format = SDL_AUDIO_F32;
+        spec.channels = 1;
+        spec.freq = sample_rate;
+
+        SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(
+            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+            &spec,
+            nullptr,
+            nullptr);
+        if (!stream)
+        {
+            fprintf(stderr, "ERROR: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+            if (!audio_was_initialized)
+            {
+                SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            }
+            return false;
+        }
+
+        const int byte_len = (int)(samples.size() * sizeof(float));
+        if (!SDL_PutAudioStreamData(stream, samples.data(), byte_len))
+        {
+            fprintf(stderr, "ERROR: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
+            SDL_DestroyAudioStream(stream);
+            if (!audio_was_initialized)
+            {
+                SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            }
+            return false;
+        }
+
+        // Mark end-of-input so any buffered conversion/resampling can be drained.
+        if (!SDL_FlushAudioStream(stream))
+        {
+            fprintf(stderr, "ERROR: SDL_FlushAudioStream failed: %s\n", SDL_GetError());
+            SDL_DestroyAudioStream(stream);
+            if (!audio_was_initialized)
+            {
+                SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            }
+            return false;
+        }
+
+        // SDL_OpenAudioDeviceStream opens device paused; resume to start playback.
+        if (!SDL_ResumeAudioStreamDevice(stream))
+        {
+            fprintf(stderr, "ERROR: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
+            SDL_DestroyAudioStream(stream);
+            if (!audio_was_initialized)
+            {
+                SDL_QuitSubSystem(SDL_INIT_AUDIO);
+            }
+            return false;
+        }
+
+        // Block until all queued input data has been consumed by the stream.
+        while (true)
+        {
+            const int queued = SDL_GetAudioStreamQueued(stream);
+            if (queued < 0)
+            {
+                fprintf(stderr, "ERROR: SDL_GetAudioStreamQueued failed: %s\n", SDL_GetError());
+                SDL_DestroyAudioStream(stream);
+                if (!audio_was_initialized)
+                {
+                    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+                }
+                return false;
+            }
+            if (queued == 0)
+            {
+                break;
+            }
+            SDL_Delay(10);
+        }
+
+        // Give backend device buffer a moment to drain after stream queue reaches zero.
+        SDL_Delay(20);
+
+        SDL_DestroyAudioStream(stream);
+        if (!audio_was_initialized)
+        {
+            SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        }
+        return true;
     }
 
 } // namespace qwen3_tts

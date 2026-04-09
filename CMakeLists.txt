@@ -30,6 +30,9 @@ find_package(Threads REQUIRED)
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 set(GGML_BUILD_DIR "${GGML_DIR}/build")
+# set(SDL3_DIR "${CMAKE_SOURCE_DIR}/cmake")
+find_package(SDL3 REQUIRED)
+
 
 # Detect Metal backend availability
 if(APPLE AND EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib")
@@ -168,8 +171,14 @@ target_link_libraries(qwen3_tts PUBLIC
     tts_transformer
     audio_tokenizer_encoder
     audio_tokenizer_decoder
+    SDL3::SDL3
     Threads::Threads
 )
+# target_link_libraries(
+#     qwen3_tts PRIVATE
+#     SDL3
+#     SDL3main
+# )
 
 # Shared library with C API (for Nim FFI)
 add_library(qwen3tts_shared SHARED

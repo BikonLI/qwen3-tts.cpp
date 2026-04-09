@@ -1,0 +1,45 @@
+BasedOnStyle: Microsoft
+UseTab: Never
+IndentWidth: 4
+TabWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+NamespaceIndentation: All
+FixNamespaceComments: false
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+SeparateDefinitionBlocks: Always
+
+# Java-like brace style: opening brace stays on the same line.
+BreakBeforeBraces: Attach
+
+# Keep return type + function name + '(' together on one line.
+BreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 1000000
+
+# If declaration exceeds the limit, wrap parameters instead of splitting before '('.
+AlignAfterOpenBracket: BlockIndent
+BinPackParameters: true
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: false
+
+# Strictly disallow one-line short forms such as: func {}
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortLambdasOnASingleLine: None
+
+# Ensure empty function bodies are split across lines.
+SplitEmptyFunction: true
+
+# Deterministic include ordering.
+IncludeBlocks: Regroup
+SortIncludes: true
+IncludeCategories:
+	- Regex: '^<.*\.h>'
+	- Regex: '^<.*>'
+	- Regex: '^"aimbot/.*"'
+	- Regex: '^".*"'

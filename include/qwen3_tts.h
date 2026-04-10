@@ -13,6 +13,22 @@
 namespace qwen3_tts
 {
 
+    enum class tts_task_type
+    {
+        auto_task = 0,
+        voice_clone = 1,
+        custom_voice = 2,
+        voice_design = 3,
+    };
+
+    enum class tts_model_variant
+    {
+        auto_variant = 0,
+        base = 1,
+        custom_voice = 2,
+        voice_design = 3,
+    };
+
     // TTS generation parameters
     struct tts_params
     {
@@ -41,7 +57,20 @@ namespace qwen3_tts
         float repetition_penalty = 1.05f;
 
         // Language ID for codec (2050=en, 2069=ru, 2055=zh, 2058=ja, 2064=ko, 2053=de, 2061=fr, 2054=es)
-        int32_t language_id = 2050;
+        // Set to -1 for auto/no-language-control path.
+        int32_t language_id = -1;
+
+        // Task and model variant routing
+        tts_task_type task_type = tts_task_type::auto_task;
+        tts_model_variant model_variant = tts_model_variant::auto_variant;
+
+        // Instruction controls
+        std::string instruct;
+        std::string speaker;
+        std::string reference_text;
+
+        // Base model option: when true, run with x-vector only and do not require reference_text.
+        bool x_vector_only_mode = false;
     };
 
     // TTS generation result
@@ -137,6 +166,8 @@ namespace qwen3_tts
         // Check if models are loaded
         bool is_loaded() const { return models_loaded_; }
 
+        tts_model_variant loaded_model_variant() const { return loaded_model_variant_; }
+
     private:
         tts_result synthesize_internal(const std::string &text,
                                        const float *speaker_embedding,
@@ -153,6 +184,7 @@ namespace qwen3_tts
         bool transformer_loaded_ = false;
         bool decoder_loaded_ = false;
         bool low_mem_mode_ = false;
+        tts_model_variant loaded_model_variant_ = tts_model_variant::auto_variant;
         std::string error_msg_;
         std::string tts_model_path_;
         std::string decoder_model_path_;

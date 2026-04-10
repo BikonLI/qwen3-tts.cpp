@@ -153,6 +153,11 @@ bool TextTokenizer::load_from_gguf(struct gguf_context * ctx) {
         // Try with space prefix (GPT-2 style)
         assistant_token_id_ = find_token("Ġassistant");
     }
+
+    user_token_id_ = find_token("user");
+    if (user_token_id_ < 0) {
+        user_token_id_ = find_token("Ġuser");
+    }
     
     // Newline token
     newline_token_id_ = find_token("Ċ");  // GPT-2 encoding for '\n'
@@ -290,13 +295,20 @@ std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
     return tokens;
 }
 
-std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text) const {
+std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text,
+                                                   const std::string & instruct,
+                                                   const std::string & speaker,
+                                                   const std::string & reference_text) const {
     if (!loaded_) {
         return {};
     }
     
-    // Format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    // Keep assistant text prompt separate from instruct prompt.
+    // In official pipeline, instruct is passed as a separate input branch.
     std::vector<int32_t> tokens;
+    (void) instruct;
+    (void) speaker;
+    (void) reference_text;
     
     // <|im_start|>
     tokens.push_back(config_.bos_token_id);
@@ -307,7 +319,7 @@ std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text) con
     // \n
     tokens.push_back(newline_token_id_);
     
-    // Encode the text
+    // Encode the transcript section only
     auto text_tokens = encode(text);
     tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
     
@@ -326,6 +338,25 @@ std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text) con
     // \n
     tokens.push_back(newline_token_id_);
     
+    return tokens;
+}
+
+std::vector<int32_t> TextTokenizer::encode_instruct_for_tts(const std::string & instruct) const {
+    if (!loaded_ || instruct.empty() || user_token_id_ < 0) {
+        return {};
+    }
+
+    // Format: <|im_start|>user\n{instruct}<|im_end|>\n
+    std::vector<int32_t> tokens;
+    tokens.push_back(config_.bos_token_id);
+    tokens.push_back(user_token_id_);
+    tokens.push_back(newline_token_id_);
+
+    auto instruct_tokens = encode(instruct);
+    tokens.insert(tokens.end(), instruct_tokens.begin(), instruct_tokens.end());
+
+    tokens.push_back(config_.eos_token_id);
+    tokens.push_back(newline_token_id_);
     return tokens;
 }
 

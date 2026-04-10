@@ -1,4 +1,4 @@
-/* qwen3tts_c_api.cpp — C API wrapper for Nim FFI.
+/* qwen3tts_c_api.cpp - C API wrapper for Nim FFI.
  *
  * Wraps qwen3_tts::Qwen3TTS C++ class in a C-linkage API.
  * Synthesis calls use @autoreleasepool on macOS to drain Metal
@@ -38,6 +38,12 @@ struct Qwen3TtsParams {
     int32_t n_threads;
     float   repetition_penalty;
     int32_t language_id;
+    int32_t task_type;
+    int32_t model_variant;
+    const char * instruct;
+    const char * speaker;
+    const char * reference_text;
+    int32_t x_vector_only_mode;
 };
 
 struct Qwen3TtsAudio {
@@ -46,7 +52,7 @@ struct Qwen3TtsAudio {
     int32_t sample_rate;
 };
 
-// Opaque handle — backs the C typedef
+// Opaque handle - backs the C typedef
 struct Qwen3Tts {
     qwen3_tts::Qwen3TTS engine;
     std::string last_error;
@@ -63,6 +69,12 @@ static qwen3_tts::tts_params to_cpp_params(const Qwen3TtsParams * p) {
         params.n_threads         = p->n_threads;
         params.repetition_penalty = p->repetition_penalty;
         params.language_id       = p->language_id;
+        params.task_type = static_cast<qwen3_tts::tts_task_type>(p->task_type);
+        params.model_variant = static_cast<qwen3_tts::tts_model_variant>(p->model_variant);
+        params.instruct = p->instruct ? p->instruct : "";
+        params.speaker = p->speaker ? p->speaker : "";
+        params.reference_text = p->reference_text ? p->reference_text : "";
+        params.x_vector_only_mode = p->x_vector_only_mode != 0;
     }
     return params;
 }
@@ -95,7 +107,13 @@ void qwen3_tts_default_params(Qwen3TtsParams * params) {
     params->top_k             = 50;
     params->n_threads         = 4;
     params->repetition_penalty = 1.05f;
-    params->language_id       = 2050; // en
+    params->language_id       = -1;
+    params->task_type         = 0;
+    params->model_variant     = 0;
+    params->instruct          = nullptr;
+    params->speaker           = nullptr;
+    params->reference_text    = nullptr;
+    params->x_vector_only_mode = 0;
 }
 
 Qwen3Tts * qwen3_tts_create(const char * model_dir, int32_t n_threads) {

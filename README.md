@@ -4,15 +4,17 @@
 
 **Benchmark Snapshot (PyTorch vs qwen3-tts.cpp):** Basic 3.19x faster, Clone 4.07x faster. Peak RSS delta: Basic +19.0%, Clone +7.7%.
 
-C++ inference for [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) using the [GGML](https://github.com/ggml-org/ggml) tensor library.
+C++ inference for [Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts) using the [GGML](https://github.com/ggml-org/ggml) tensor library.
 
 Runs the full TTS pipeline in pure C++17, including text tokenization, speaker encoding, transformer code generation, and vocoder decoding, without Python or PyTorch at inference time.
 
 ## Features
 
 - Full text-to-speech pipeline in C++17 with GGML backend
+- Supports Qwen3-TTS 0.6B and 1.7B model families (Base, CustomVoice, VoiceDesign)
 - Voice cloning from reference audio (ECAPA-TDNN x-vector extraction)
-- Greedy and sampled decoding (temperature, top-k, repetition penalty)
+- Instruct-style generation controls for CustomVoice/VoiceDesign tasks
+- Greedy and sampled decoding (temperature, top-k, top-p, repetition penalty)
 - GGUF model format (F16 and Q8_0 quantization)
 - Runtime backend selection with GPU/Metal preference and CPU fallback
 - Deterministic reference tests comparing C++ output against Python
@@ -70,9 +72,9 @@ python scripts/setup_pipeline_models.py
   -o examples/readme_example_clone.wav
 ```
 
-Expected model artifacts after step 5:
+Expected model artifacts after step 5 (example):
 
-- `models/qwen3-tts-0.6b-f16.gguf`
+- `models/qwen3-tts-0.6b-f16.gguf` or `models/qwen3-tts-1.7b-f16.gguf`
 - `models/qwen3-tts-tokenizer-f16.gguf`
 - `models/coreml/code_predictor.mlpackage` (on macOS)
 
@@ -135,22 +137,26 @@ Useful flags:
 Convert HuggingFace models to GGUF format:
 
 ```bash
-# Download the model
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-    --local-dir models/Qwen3-TTS-12Hz-0.6B-Base
+# Download a model (example: 1.7B CustomVoice)
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --local-dir models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 
 # Convert TTS model (transformer + speaker encoder + tokenizer)
-python scripts/convert_tts_to_gguf.py \
-    models/Qwen3-TTS-12Hz-0.6B-Base \
-    models/qwen3-tts-0.6b-f16.gguf
+python scripts/convert_tts_to_gguf_v2.py \
+    models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    models/qwen3-tts-1.7b-f16.gguf
 
 # Convert vocoder (audio decoder)
 python scripts/convert_tokenizer_to_gguf.py \
-    models/Qwen3-TTS-12Hz-0.6B-Base \
+    models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     models/qwen3-tts-tokenizer-f16.gguf
 ```
 
 Place both `.gguf` files in a `models/` directory.
+
+For 1.7B models, always use `scripts/convert_tts_to_gguf_v2.py`.
+The legacy converter does not export all code predictor projection tensors/metadata,
+which can cause severe quality degradation (noise-like output).
 
 ## Usage
 
@@ -159,7 +165,18 @@ Place both `.gguf` files in a `models/` directory.
 ./build/qwen3-tts-cli -m models -t "Hello, world!" -o hello.wav
 
 # Voice cloning from reference audio
-./build/qwen3-tts-cli -m models -t "Hello! How are you?" -r reference.wav -o cloned.wav
+./build/qwen3-tts-cli -m models --task voice_clone \
+    -t "Hello! How are you?" -r reference.wav --ref-text "Hello there." -o cloned.wav
+
+# 1.7B CustomVoice with instruct
+./build/qwen3-tts-cli -m models --task custom_voice \
+    --speaker Vivian --instruct "Speak with strong excitement." \
+    -t "Today is a great day!" -o custom.wav
+
+# 1.7B VoiceDesign with instruct
+./build/qwen3-tts-cli -m models --task voice_design \
+    --instruct "Female, warm timbre, calm and reassuring." \
+    -t "Take a deep breath, everything is under control." -o design.wav
 
 # Greedy decoding with max length
 ./build/qwen3-tts-cli -m models -t "Hello!" -r ref.wav -o out.wav \
@@ -174,6 +191,12 @@ Place both `.gguf` files in a `models/` directory.
 | `-t, --text <text>` | Text to synthesize | (required) |
 | `-o, --output <file>` | Output WAV file path | `output.wav` |
 | `-r, --reference <file>` | Reference audio for voice cloning | (none) |
+| `--task <name>` | Task type: auto, voice_clone, custom_voice, voice_design | auto |
+| `--model-variant <name>` | Override model variant: auto, base, custom_voice, voice_design | auto |
+| `--speaker <name>` | Preset speaker name for custom_voice | (none) |
+| `--instruct <text>` | Natural-language instruction | (none) |
+| `--ref-text <text>` | Reference transcript for voice_clone | (none) |
+| `--x-vector-only` | Voice clone without reference transcript | false |
 | `--temperature <val>` | Sampling temperature (0 = greedy) | 0.9 |
 | `--top-k <n>` | Top-k sampling (0 = disabled) | 50 |
 | `--top-p <val>` | Top-p sampling | 1.0 |
@@ -181,7 +204,7 @@ Place both `.gguf` files in a `models/` directory.
 | `--repetition-penalty <val>` | Repetition penalty on codebook-0 token generation | 1.05 |
 | `-j, --threads <n>` | Number of compute threads | 4 |
 
-`--top-p` is currently parsed by the CLI but not yet wired into transformer sampling.
+`--top-p` is now wired into both codebook-0 and code predictor sampling paths.
 
 On macOS, CoreML code predictor is enabled by default when `models/coreml/code_predictor.mlpackage` exists.
 Set `QWEN3_TTS_USE_COREML=0` to disable it. Low-memory mode is opt-in via `QWEN3_TTS_LOW_MEM=1`.

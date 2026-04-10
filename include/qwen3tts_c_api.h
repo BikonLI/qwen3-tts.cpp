@@ -1,4 +1,4 @@
-/* qwen3tts_c_api.h — C API wrapper for qwen3-tts.cpp (Nim FFI) */
+/* qwen3tts_c_api.h - C API wrapper for qwen3-tts.cpp (Nim FFI) */
 #ifndef QWEN3TTS_C_API_H
 #define QWEN3TTS_C_API_H
 
@@ -19,7 +19,15 @@ typedef struct Qwen3TtsParams {
     int32_t top_k;               /* default: 50, 0=disabled */
     int32_t n_threads;           /* default: 4 */
     float   repetition_penalty;  /* default: 1.05 */
-    int32_t language_id;         /* 2050=en, 2058=ja, 2055=zh, etc. */
+    int32_t language_id;         /* -1=auto, 2050=en, 2058=ja, 2055=zh, etc. */
+
+    int32_t task_type;           /* 0=auto,1=voice_clone,2=custom_voice,3=voice_design */
+    int32_t model_variant;       /* 0=auto,1=base,2=custom_voice,3=voice_design */
+
+    const char* instruct;        /* optional */
+    const char* speaker;         /* optional */
+    const char* reference_text;  /* required for base voice_clone unless x_vector_only_mode */
+    int32_t x_vector_only_mode;  /* 0=false, 1=true */
 } Qwen3TtsParams;
 
 /* Generated audio result */
@@ -33,8 +41,8 @@ typedef struct Qwen3TtsAudio {
 void qwen3_tts_default_params(Qwen3TtsParams* params);
 
 /* Create TTS engine and load models from directory.
- * model_dir must contain qwen3-tts-0.6b-f16.gguf and
- * qwen3-tts-tokenizer-f16.gguf.
+ * model_dir must contain one TTS gguf (0.6B/1.7B, Base/CustomVoice/VoiceDesign)
+ * and one tokenizer gguf.
  * Returns NULL on failure. */
 Qwen3Tts* qwen3_tts_create(const char* model_dir, int32_t n_threads);
 

@@ -5,11 +5,14 @@
 
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <algorithm>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -19,6 +22,127 @@
 #endif
 
 namespace qwen3_tts {
+
+    namespace fs = std::filesystem;
+
+    static std::string to_lower_copy(const std::string &s) {
+        std::string out = s;
+        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return out;
+    }
+
+    static tts_model_variant infer_model_variant_from_path(const std::string &path) {
+        const std::string lower = to_lower_copy(path);
+        if (lower.find("voicedesign") != std::string::npos) {
+            return tts_model_variant::voice_design;
+        }
+        if (lower.find("customvoice") != std::string::npos) {
+            return tts_model_variant::custom_voice;
+        }
+        if (lower.find("base") != std::string::npos) {
+            return tts_model_variant::base;
+        }
+        return tts_model_variant::auto_variant;
+    }
+
+    static tts_model_variant infer_model_variant_from_gguf(struct gguf_context *ctx) {
+        if (!ctx) {
+            return tts_model_variant::auto_variant;
+        }
+        const int64_t name_key = gguf_find_key(ctx, "general.name");
+        if (name_key >= 0) {
+            const char *name = gguf_get_val_str(ctx, name_key);
+            if (name && name[0] != '\0') {
+                return infer_model_variant_from_path(name);
+            }
+        }
+        return tts_model_variant::auto_variant;
+    }
+
+    static const char *variant_name(tts_model_variant v) {
+        switch (v) {
+            case tts_model_variant::base: return "base";
+            case tts_model_variant::custom_voice: return "custom_voice";
+            case tts_model_variant::voice_design: return "voice_design";
+            default: return "auto";
+        }
+    }
+
+    static const char *task_name(tts_task_type t) {
+        switch (t) {
+            case tts_task_type::voice_clone: return "voice_clone";
+            case tts_task_type::custom_voice: return "custom_voice";
+            case tts_task_type::voice_design: return "voice_design";
+            default: return "auto";
+        }
+    }
+
+    static bool discover_model_paths(const std::string &model_dir,
+                                     std::string &tts_model_path,
+                                     std::string &tokenizer_model_path,
+                                     std::string &error_msg) {
+        tts_model_path.clear();
+        tokenizer_model_path.clear();
+
+        std::vector<std::string> q8_candidates;
+        std::vector<std::string> f16_candidates;
+        std::vector<std::string> fallback_tts;
+        std::vector<std::string> tokenizer_candidates;
+
+        std::error_code ec;
+        if (!fs::exists(model_dir, ec) || !fs::is_directory(model_dir, ec)) {
+            error_msg = "Model directory does not exist: " + model_dir;
+            return false;
+        }
+
+        for (const auto &entry : fs::directory_iterator(model_dir, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::string path = entry.path().string();
+            const std::string name = to_lower_copy(entry.path().filename().string());
+            if (entry.path().extension().string() != ".gguf") {
+                continue;
+            }
+
+            if (name.find("tokenizer") != std::string::npos) {
+                tokenizer_candidates.push_back(path);
+                continue;
+            }
+
+            if (name.find("q8_0") != std::string::npos) {
+                q8_candidates.push_back(path);
+            } else if (name.find("f16") != std::string::npos) {
+                f16_candidates.push_back(path);
+            } else {
+                fallback_tts.push_back(path);
+            }
+        }
+
+        auto pick_first_sorted = [](std::vector<std::string> &v) -> std::string {
+            if (v.empty()) {
+                return {};
+            }
+            std::sort(v.begin(), v.end());
+            return v.front();
+        };
+
+        if (!q8_candidates.empty()) {
+            tts_model_path = pick_first_sorted(q8_candidates);
+        } else if (!f16_candidates.empty()) {
+            tts_model_path = pick_first_sorted(f16_candidates);
+        } else {
+            tts_model_path = pick_first_sorted(fallback_tts);
+        }
+
+        tokenizer_model_path = pick_first_sorted(tokenizer_candidates);
+        if (tts_model_path.empty() || tokenizer_model_path.empty()) {
+            error_msg = "Failed to discover GGUF files in model dir. Need one TTS GGUF and one tokenizer GGUF.";
+            return false;
+        }
+
+        return true;
+    }
 
     static int64_t get_time_ms() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -124,20 +248,14 @@ namespace qwen3_tts {
         transformer_loaded_ = false;
         decoder_loaded_ = false;
 
-        // Construct model paths — prefer quantized (q8_0) over full-precision (f16)
         std::string tts_model_path;
-        std::string q8_path = model_dir + "/qwen3-tts-0.6b-q8_0.gguf";
-        std::string f16_path = model_dir + "/qwen3-tts-0.6b-f16.gguf";
-        FILE *q8_check = fopen(q8_path.c_str(), "r");
-        if (q8_check) {
-            fclose(q8_check);
-            tts_model_path = q8_path;
-        } else {
-            tts_model_path = f16_path;
+        std::string tokenizer_model_path;
+        if (!discover_model_paths(model_dir, tts_model_path, tokenizer_model_path, error_msg_)) {
+            return false;
         }
-        std::string tokenizer_model_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
         tts_model_path_ = tts_model_path;
         decoder_model_path_ = tokenizer_model_path;
+        loaded_model_variant_ = infer_model_variant_from_path(tts_model_path + " " + model_dir);
         encoder_loaded_ = false;
         transformer_loaded_ = false;
         decoder_loaded_ = false;
@@ -158,6 +276,12 @@ namespace qwen3_tts {
             if (!loader.open(tts_model_path)) {
                 error_msg_ = "Failed to open TTS model: " + loader.get_error();
                 return false;
+            }
+
+            // Prefer GGUF metadata for variant detection; path-based inference is fallback only.
+            tts_model_variant meta_variant = infer_model_variant_from_gguf(loader.get_ctx());
+            if (meta_variant != tts_model_variant::auto_variant) {
+                loaded_model_variant_ = meta_variant;
             }
 
             if (!tokenizer_.load_from_gguf(loader.get_ctx())) {
@@ -186,6 +310,7 @@ namespace qwen3_tts {
             transformer_.get_config().hidden_size, transformer_.get_config().n_layers,
             (long long)(get_time_ms() - t_transformer_start)
         );
+        fprintf(stderr, "  Inferred model variant: %s\n", variant_name(loaded_model_variant_));
         log_memory_usage("load/after-transformer");
 
         if (!low_mem_mode_) {
@@ -224,6 +349,11 @@ namespace qwen3_tts {
             return result;
         }
 
+        if (params.task_type == tts_task_type::voice_clone && !params.x_vector_only_mode) {
+            result.error_msg = "voice_clone task requires reference audio unless x_vector_only_mode=true";
+            return result;
+        }
+
         // For basic synthesis without voice cloning, we use a zero speaker embedding
         // This will use the model's default voice characteristics
         std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
@@ -235,6 +365,13 @@ namespace qwen3_tts {
         const std::string &text, const std::string &reference_audio, const tts_params &params
     ) {
         tts_result result;
+
+        if (params.task_type == tts_task_type::voice_clone &&
+            !params.x_vector_only_mode &&
+            params.reference_text.empty()) {
+            result.error_msg = "voice_clone task requires reference_text when x_vector_only_mode is false";
+            return result;
+        }
 
         std::vector<float> ref_samples;
         int ref_sample_rate;
@@ -356,6 +493,61 @@ namespace qwen3_tts {
     tts_result Qwen3TTS::synthesize_internal(
         const std::string &text, const float *speaker_embedding, const tts_params &params, tts_result &result
     ) {
+        if (loaded_model_variant_ != tts_model_variant::auto_variant &&
+            params.model_variant != tts_model_variant::auto_variant &&
+            params.model_variant != loaded_model_variant_) {
+            result.error_msg = std::string("Requested --model-variant '") +
+                               variant_name(params.model_variant) +
+                               "' does not match loaded model variant '" +
+                               variant_name(loaded_model_variant_) +
+                               "'.";
+            return result;
+        }
+
+        tts_model_variant effective_variant =
+            (params.model_variant != tts_model_variant::auto_variant) ? params.model_variant : loaded_model_variant_;
+        if (effective_variant == tts_model_variant::auto_variant) {
+            effective_variant = tts_model_variant::base;
+        }
+
+        if (params.task_type != tts_task_type::auto_task &&
+            loaded_model_variant_ != tts_model_variant::auto_variant) {
+            bool compatible = true;
+            switch (params.task_type) {
+                case tts_task_type::voice_clone:
+                    compatible = (loaded_model_variant_ == tts_model_variant::base);
+                    break;
+                case tts_task_type::custom_voice:
+                    compatible = (loaded_model_variant_ == tts_model_variant::custom_voice);
+                    break;
+                case tts_task_type::voice_design:
+                    compatible = (loaded_model_variant_ == tts_model_variant::voice_design);
+                    break;
+                default:
+                    compatible = true;
+                    break;
+            }
+            if (!compatible) {
+                result.error_msg = std::string("Task '") + task_name(params.task_type) +
+                                   "' is incompatible with loaded model variant '" +
+                                   variant_name(loaded_model_variant_) +
+                                   "'. Please use a matching model family.";
+                return result;
+            }
+        }
+
+        if (params.task_type == tts_task_type::voice_design &&
+            effective_variant != tts_model_variant::voice_design) {
+            result.error_msg = std::string("voice_design task requires voice_design model variant, got ") +
+                               variant_name(effective_variant);
+            return result;
+        }
+        if (params.task_type == tts_task_type::custom_voice &&
+            effective_variant == tts_model_variant::base) {
+            result.error_msg = "custom_voice task requires custom_voice or voice_design variant";
+            return result;
+        }
+
         int64_t t_total_start = get_time_ms();
         auto sample_memory = [&](const char *stage) {
             process_memory_snapshot mem;
@@ -385,7 +577,13 @@ namespace qwen3_tts {
 
         // Step 2: Tokenize input text
         int64_t t_tokenize_start = get_time_ms();
-        std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
+        std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(
+            text,
+            "",
+            params.speaker,
+            params.reference_text
+        );
+        std::vector<int32_t> instruct_tokens = tokenizer_.encode_instruct_for_tts(params.instruct);
         result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
         sample_memory("synth/after-tokenize");
 
@@ -424,7 +622,10 @@ namespace qwen3_tts {
         std::vector<int32_t> speech_codes;
         if (!transformer_.generate(
                 text_tokens.data(), (int32_t)text_tokens.size(), speaker_embedding, params.max_audio_tokens,
-                speech_codes, params.language_id, params.repetition_penalty, params.temperature, params.top_k
+                speech_codes, params.language_id, params.repetition_penalty, params.temperature, params.top_k,
+                params.top_p,
+                instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                (int32_t)instruct_tokens.size()
             )) {
             result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
             return result;
@@ -812,3 +1013,4 @@ namespace qwen3_tts {
     }
 
 } // namespace qwen3_tts
+

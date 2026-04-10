@@ -12,12 +12,18 @@ void print_usage(const char *program) {
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "  --task <name>          Task: auto,voice_clone,custom_voice,voice_design\n");
+    fprintf(stderr, "  --model-variant <name> Variant: auto,base,custom_voice,voice_design\n");
+    fprintf(stderr, "  --speaker <name>       Preset speaker name for custom_voice\n");
+    fprintf(stderr, "  --instruct <text>      Natural-language instruction\n");
+    fprintf(stderr, "  --ref-text <text>      Reference transcript for voice_clone\n");
+    fprintf(stderr, "  --x-vector-only        Voice clone without reference text\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
     fprintf(stderr, "  --max-tokens <n>       Maximum audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repetition-penalty <val> Repetition penalty (default: 1.05)\n");
-    fprintf(stderr, "  -l, --language <lang>  Language: en,ru,zh,ja,ko,de,fr,es (default: en)\n");
+    fprintf(stderr, "  -l, --language <lang>  Language: auto,en,ru,zh,ja,ko,de,fr,es,it,pt (default: auto)\n");
     fprintf(stderr, "  -j, --threads <n>      Number of threads (default: 4)\n");
     fprintf(stderr, "  -h, --help             Show this help\n");
     fprintf(stderr, "\n");
@@ -76,6 +82,62 @@ int main(int argc, char **argv) {
                 return 1;
             }
             reference_audio = argv[i];
+        } else if (arg == "--task") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing task value\n");
+                return 1;
+            }
+            std::string task = argv[i];
+            if (task == "auto")
+                params.task_type = qwen3_tts::tts_task_type::auto_task;
+            else if (task == "voice_clone" || task == "clone" || task == "base")
+                params.task_type = qwen3_tts::tts_task_type::voice_clone;
+            else if (task == "custom_voice" || task == "custom")
+                params.task_type = qwen3_tts::tts_task_type::custom_voice;
+            else if (task == "voice_design" || task == "design")
+                params.task_type = qwen3_tts::tts_task_type::voice_design;
+            else {
+                fprintf(stderr, "Error: unknown task '%s'\n", task.c_str());
+                return 1;
+            }
+        } else if (arg == "--model-variant") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing model-variant value\n");
+                return 1;
+            }
+            std::string variant = argv[i];
+            if (variant == "auto")
+                params.model_variant = qwen3_tts::tts_model_variant::auto_variant;
+            else if (variant == "base")
+                params.model_variant = qwen3_tts::tts_model_variant::base;
+            else if (variant == "custom_voice" || variant == "custom")
+                params.model_variant = qwen3_tts::tts_model_variant::custom_voice;
+            else if (variant == "voice_design" || variant == "design")
+                params.model_variant = qwen3_tts::tts_model_variant::voice_design;
+            else {
+                fprintf(stderr, "Error: unknown model variant '%s'\n", variant.c_str());
+                return 1;
+            }
+        } else if (arg == "--speaker") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing speaker value\n");
+                return 1;
+            }
+            params.speaker = argv[i];
+        } else if (arg == "--instruct") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing instruct value\n");
+                return 1;
+            }
+            params.instruct = argv[i];
+        } else if (arg == "--ref-text") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing ref-text value\n");
+                return 1;
+            }
+            params.reference_text = argv[i];
+        } else if (arg == "--x-vector-only") {
+            params.x_vector_only_mode = true;
         } else if (arg == "--temperature") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing temperature value\n");
@@ -112,7 +174,9 @@ int main(int argc, char **argv) {
                 return 1;
             }
             std::string lang = argv[i];
-            if (lang == "en" || lang == "english")
+            if (lang == "auto")
+                params.language_id = -1;
+            else if (lang == "en" || lang == "english")
                 params.language_id = 2050;
             else if (lang == "ru" || lang == "russian")
                 params.language_id = 2069;
@@ -134,7 +198,7 @@ int main(int argc, char **argv) {
                 params.language_id = 2071;
             else {
                 fprintf(
-                    stderr, "Error: unknown language '%s'. Supported: en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str()
+                    stderr, "Error: unknown language '%s'. Supported: auto,en,ru,zh,ja,ko,de,fr,es,it,pt\n", lang.c_str()
                 );
                 return 1;
             }
@@ -164,6 +228,32 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (params.task_type == qwen3_tts::tts_task_type::auto_task) {
+        if (!reference_audio.empty()) {
+            params.task_type = qwen3_tts::tts_task_type::voice_clone;
+        } else if (!params.speaker.empty()) {
+            params.task_type = qwen3_tts::tts_task_type::custom_voice;
+        } else if (!params.instruct.empty()) {
+            params.task_type = qwen3_tts::tts_task_type::voice_design;
+        }
+    }
+
+    if (params.task_type == qwen3_tts::tts_task_type::voice_clone) {
+        if (reference_audio.empty()) {
+            fprintf(stderr, "Error: voice_clone task requires --reference\n");
+            return 1;
+        }
+        if (!params.x_vector_only_mode && params.reference_text.empty()) {
+            fprintf(stderr, "Error: voice_clone task requires --ref-text unless --x-vector-only is set\n");
+            return 1;
+        }
+    }
+
+    if (params.task_type == qwen3_tts::tts_task_type::voice_design && params.instruct.empty()) {
+        fprintf(stderr, "Error: voice_design task requires --instruct\n");
+        return 1;
+    }
+
     // Initialize TTS
     qwen3_tts::Qwen3TTS tts;
 
@@ -181,11 +271,15 @@ int main(int argc, char **argv) {
     // Generate speech
     qwen3_tts::tts_result result;
 
-    if (reference_audio.empty()) {
+    if (params.task_type == qwen3_tts::tts_task_type::voice_clone) {
+        fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", text.c_str());
+        fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());
+        result = tts.synthesize_with_voice(text, reference_audio, params);
+    } else if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
         result = tts.synthesize(text, params);
     } else {
-        fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", text.c_str());
+        fprintf(stderr, "Synthesizing with optional voice prompt: \"%s\"\n", text.c_str());
         fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());
         result = tts.synthesize_with_voice(text, reference_audio, params);
     }

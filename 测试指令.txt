@@ -1,0 +1,3 @@
+build\Release\qwen3-tts-cli.exe  -m ./models-1.7B-v2 -t "Son of bitch." --instruct "" --task voice_design --model-variant voice_design 
+build\Release\qwen3-tts-cli.exe  -m ./models-1.7B-v2 -t "text/test5.txt" --instruct "" --task voice_design --model-variant voice_design 
+build\Release\qwen3-tts-cli.exe -m models-1.7B-v2 -t "text/test3.txt" --task custom_voice --model-variant custom_voice --speaker Ryan --instruct "Very, very low bass"

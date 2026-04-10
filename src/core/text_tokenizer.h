@@ -29,8 +29,16 @@ public:
     // Encode text to token IDs
     std::vector<int32_t> encode(const std::string & text) const;
     
-    // Encode with TTS format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-    std::vector<int32_t> encode_for_tts(const std::string & text) const;
+    // Encode assistant text turn for TTS generation:
+    // <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    std::vector<int32_t> encode_for_tts(const std::string & text,
+                                        const std::string & instruct = "",
+                                        const std::string & speaker = "",
+                                        const std::string & reference_text = "") const;
+
+    // Encode instruct turn for TTS generation:
+    // <|im_start|>user\n{instruct}<|im_end|>\n
+    std::vector<int32_t> encode_instruct_for_tts(const std::string & instruct) const;
     
     // Decode token IDs to text
     std::string decode(const std::vector<int32_t> & tokens) const;
@@ -66,8 +74,9 @@ private:
     // BPE merges: pair -> rank (lower rank = higher priority)
     std::map<std::pair<std::string, std::string>, int32_t> bpe_ranks_;
     
-    // Special token for "assistant" and newline
+    // Special tokens for chat template roles and newline
     int32_t assistant_token_id_ = 77091;
+    int32_t user_token_id_ = -1;
     int32_t newline_token_id_ = 198;  // '\n' encoded
     
     // Helper: convert bytes to unicode (GPT-2 style byte encoding)

@@ -80,6 +80,12 @@ struct tts_transformer_config {
     // Code predictor
     int32_t code_pred_layers = 5;
     int32_t code_pred_vocab_size = 2048;  // Per-codebook vocab
+    int32_t code_pred_hidden_size = 1024;
+    int32_t code_pred_intermediate_size = 3072;
+    int32_t code_pred_attention_heads = 16;
+    int32_t code_pred_key_value_heads = 8;
+    int32_t code_pred_head_dim = 128;
+    int32_t code_pred_input_size = 1024;
     
     // Special codec tokens
     int32_t codec_pad_id = 2148;
@@ -144,6 +150,10 @@ struct tts_transformer_model {
      
      // Code predictor output norm (final RMS norm before lm_head)
      struct ggml_tensor * code_pred_output_norm = nullptr;  // [hidden_size]
+
+    // Optional projection from talker/code embedding space to code predictor hidden space.
+    struct ggml_tensor * code_pred_small_to_mtp_proj = nullptr;      // [code_pred_input_size, code_pred_hidden_size]
+    struct ggml_tensor * code_pred_small_to_mtp_proj_bias = nullptr; // [code_pred_hidden_size]
      
      // Code predictor per-codebook embeddings and heads (15 codebooks, 0 uses talker output)
      std::vector<struct ggml_tensor *> code_pred_embd;  // [hidden_size, code_pred_vocab_size] x 15
@@ -251,7 +261,8 @@ public:
     bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token, 
                                        std::vector<int32_t> & output,
                                        float temperature = 0.9f,
-                                       int32_t top_k = 50);
+                                       int32_t top_k = 50,
+                                       float top_p = 1.0f);
     
     // Generate speech codes autoregressively
     // text_tokens: input text token IDs [n_tokens]
@@ -261,10 +272,13 @@ public:
     bool generate(const int32_t * text_tokens, int32_t n_tokens,
                   const float * speaker_embd, int32_t max_len,
                   std::vector<int32_t> & output,
-                  int32_t language_id = 2050,
+                  int32_t language_id = -1,
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
-                  int32_t top_k = 50);
+                  int32_t top_k = 50,
+                  float top_p = 1.0f,
+                  const int32_t * instruct_tokens = nullptr,
+                  int32_t n_instruct_tokens = 0);
     
     const tts_transformer_config & get_config() const { return model_.config; }
     
@@ -284,9 +298,11 @@ private:
     bool predict_codes_autoregressive_coreml(const float * hidden, int32_t codebook_0_token,
                                              std::vector<int32_t> & output,
                                              float temperature,
-                                             int32_t top_k);
+                                             int32_t top_k,
+                                             float top_p);
 
     bool build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
+                             const int32_t * instruct_tokens, int32_t n_instruct_tokens,
                              const float * speaker_embd, int32_t language_id,
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,

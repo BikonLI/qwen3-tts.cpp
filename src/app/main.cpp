@@ -1,90 +1,139 @@
 #include "qwen3_tts.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
+#include <filesystem>
 #include <string>
 #include <vector>
 
 namespace {
 
-using qwen3_tts::Qwen3TTSModelHub;
-using qwen3_tts::tts_common_params;
-using qwen3_tts::tts_custom_voice_params;
-using qwen3_tts::tts_model_id;
-using qwen3_tts::tts_result;
-using qwen3_tts::tts_voice_clone_params;
-using qwen3_tts::tts_voice_design_params;
+namespace fs = std::filesystem;
 
-enum class synth_mode {
-    auto_mode = 0,
-    voice_clone,
-    custom_voice,
-    custom_voice_instruct,
-    voice_design,
-};
-
-const char *model_id_name(tts_model_id model_id) {
-    switch (model_id) {
-        case tts_model_id::model_06b_base: return "06b_base";
-        case tts_model_id::model_06b_custom_voice: return "06b_custom_voice";
-        case tts_model_id::model_1_7b_base: return "1.7b_base";
-        case tts_model_id::model_1_7b_custom_voice: return "1.7b_custom_voice";
-        case tts_model_id::model_1_7b_voice_design: return "1.7b_voice_design";
-        default: return "unknown";
-    }
+static std::string to_lower_copy(const std::string &s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return out;
 }
 
-bool parse_model_id(const std::string &s, tts_model_id &out) {
-    if (s == "06b_base") {
-        out = tts_model_id::model_06b_base;
-        return true;
+static std::string pick_first_sorted(std::vector<std::string> &v) {
+    if (v.empty()) {
+        return {};
     }
-    if (s == "06b_custom_voice") {
-        out = tts_model_id::model_06b_custom_voice;
-        return true;
-    }
-    if (s == "1.7b_base") {
-        out = tts_model_id::model_1_7b_base;
-        return true;
-    }
-    if (s == "1.7b_custom_voice") {
-        out = tts_model_id::model_1_7b_custom_voice;
-        return true;
-    }
-    if (s == "1.7b_voice_design") {
-        out = tts_model_id::model_1_7b_voice_design;
-        return true;
-    }
-    return false;
+    std::sort(v.begin(), v.end());
+    return v.front();
 }
 
-bool parse_mode(const std::string &s, synth_mode &out) {
-    if (s == "auto") {
-        out = synth_mode::auto_mode;
+static bool resolve_gguf_path(
+    const std::string &path_or_dir,
+    bool expect_tokenizer,
+    std::string &resolved,
+    std::string &error_msg
+) {
+    resolved.clear();
+    error_msg.clear();
+
+    std::error_code ec;
+    if (fs::exists(path_or_dir, ec) && fs::is_regular_file(path_or_dir, ec)) {
+        if (fs::path(path_or_dir).extension().string() != ".gguf") {
+            error_msg = "Path is not a GGUF file: " + path_or_dir;
+            return false;
+        }
+        resolved = path_or_dir;
         return true;
     }
-    if (s == "voice" || s == "voice_clone") {
-        out = synth_mode::voice_clone;
+
+    if (!fs::exists(path_or_dir, ec) || !fs::is_directory(path_or_dir, ec)) {
+        error_msg = "Path does not exist: " + path_or_dir;
+        return false;
+    }
+
+    std::vector<std::string> tokenizer_candidates;
+    std::vector<std::string> q8_candidates;
+    std::vector<std::string> f16_candidates;
+    std::vector<std::string> fallback_candidates;
+
+    for (const auto &entry : fs::directory_iterator(path_or_dir, ec)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension().string() != ".gguf") {
+            continue;
+        }
+
+        const std::string path = entry.path().string();
+        const std::string name = to_lower_copy(entry.path().filename().string());
+        const bool is_tokenizer = (name.find("tokenizer") != std::string::npos);
+
+        if (expect_tokenizer) {
+            if (is_tokenizer) {
+                tokenizer_candidates.push_back(path);
+            } else {
+                fallback_candidates.push_back(path);
+            }
+            continue;
+        }
+
+        if (is_tokenizer) {
+            continue;
+        }
+
+        if (name.find("q8_0") != std::string::npos) {
+            q8_candidates.push_back(path);
+        } else if (name.find("f16") != std::string::npos) {
+            f16_candidates.push_back(path);
+        } else {
+            fallback_candidates.push_back(path);
+        }
+    }
+
+    if (expect_tokenizer) {
+        if (!tokenizer_candidates.empty()) {
+            resolved = pick_first_sorted(tokenizer_candidates);
+        } else {
+            resolved = pick_first_sorted(fallback_candidates);
+        }
+        if (resolved.empty()) {
+            error_msg = "No tokenizer GGUF found in: " + path_or_dir;
+            return false;
+        }
         return true;
     }
-    if (s == "custom" || s == "custom_voice") {
-        out = synth_mode::custom_voice;
-        return true;
+
+    if (!q8_candidates.empty()) {
+        resolved = pick_first_sorted(q8_candidates);
+    } else if (!f16_candidates.empty()) {
+        resolved = pick_first_sorted(f16_candidates);
+    } else {
+        resolved = pick_first_sorted(fallback_candidates);
     }
-    if (s == "custom_instruct") {
-        out = synth_mode::custom_voice_instruct;
-        return true;
+
+    if (resolved.empty()) {
+        error_msg = "No functional model GGUF found in: " + path_or_dir;
+        return false;
     }
-    if (s == "design" || s == "voice_design") {
-        out = synth_mode::voice_design;
-        return true;
-    }
-    return false;
+
+    return true;
 }
 
-bool parse_language_id(const std::string &lang, int32_t &out) {
+static qwen3_tts::tts_model_variant infer_model_variant_from_path(const std::string &path) {
+    const std::string lower = to_lower_copy(path);
+    if (lower.find("voicedesign") != std::string::npos) {
+        return qwen3_tts::tts_model_variant::voice_design;
+    }
+    if (lower.find("customvoice") != std::string::npos) {
+        return qwen3_tts::tts_model_variant::custom_voice;
+    }
+    if (lower.find("base") != std::string::npos) {
+        return qwen3_tts::tts_model_variant::base;
+    }
+    return qwen3_tts::tts_model_variant::auto_variant;
+}
+
+static bool parse_language_id(const std::string &lang, int32_t &out) {
     if (lang == "auto") { out = -1; return true; }
     if (lang == "en" || lang == "english") { out = 2050; return true; }
     if (lang == "ru" || lang == "russian") { out = 2069; return true; }
@@ -101,7 +150,7 @@ bool parse_language_id(const std::string &lang, int32_t &out) {
     return false;
 }
 
-bool load_text_or_file(const std::string &input, std::string &out_text) {
+static bool load_text_or_file(const std::string &input, std::string &out_text) {
     out_text = input;
 #ifdef _WIN32
     FILE *f = nullptr;
@@ -142,35 +191,30 @@ bool load_text_or_file(const std::string &input, std::string &out_text) {
     return true;
 }
 
-void print_loaded_models(const Qwen3TTSModelHub &hub) {
-    std::vector<tts_model_id> ids = hub.loaded_models();
-    fprintf(stderr, "Loaded models (%zu):\n", ids.size());
-    for (tts_model_id id : ids) {
-        fprintf(stderr, "  - %s\n", model_id_name(id));
+static const char *variant_name(qwen3_tts::tts_model_variant v) {
+    switch (v) {
+        case qwen3_tts::tts_model_variant::base: return "base";
+        case qwen3_tts::tts_model_variant::custom_voice: return "custom_voice";
+        case qwen3_tts::tts_model_variant::voice_design: return "voice_design";
+        default: return "auto";
     }
 }
 
 void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [load options] --model <model-id> --text <text> [run options]\n", program);
+    fprintf(stderr, "Usage: %s -m <tts_model_path_or_dir> -mt <tokenizer_path_or_dir> -t <text> [options]\n", program);
     fprintf(stderr, "\n");
-    fprintf(stderr, "Load options (you can specify multiple):\n");
-    fprintf(stderr, "  --tokenizer-12hz <path|dir>       Shared Qwen3-TTS-Tokenizer-12Hz GGUF (optional)\n");
-    fprintf(stderr, "  --load-06b-base <dir>             Load Qwen3-TTS-12Hz-0.6B-Base\n");
-    fprintf(stderr, "  --load-06b-custom-voice <dir>     Load Qwen3-TTS-12Hz-0.6B-CustomVoice\n");
-    fprintf(stderr, "  --load-17b-base <dir>             Load Qwen3-TTS-12Hz-1.7B-Base\n");
-    fprintf(stderr, "  --load-17b-custom-voice <dir>     Load Qwen3-TTS-12Hz-1.7B-CustomVoice\n");
-    fprintf(stderr, "  --load-17b-voice-design <dir>     Load Qwen3-TTS-12Hz-1.7B-VoiceDesign\n");
+    fprintf(stderr, "Required:\n");
+    fprintf(stderr, "  -m,  --model <path|dir>           Functional TTS model GGUF (or directory)\n");
+    fprintf(stderr, "  -mt, --model-tokenizer <path|dir> Tokenizer model GGUF (or directory)\n");
+    fprintf(stderr, "  -t,  --text <text|file>           Input text (or a file path)\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Run options:\n");
-    fprintf(stderr, "  --model <id>                      06b_base | 06b_custom_voice | 1.7b_base | 1.7b_custom_voice | 1.7b_voice_design\n");
-    fprintf(stderr, "  --mode <name>                     auto | voice | custom | custom_instruct | design\n");
-    fprintf(stderr, "  -t, --text <text|file>            Input text (or a file path)\n");
+    fprintf(stderr, "Optional:\n");
     fprintf(stderr, "  -o, --output <wav>                Output WAV file; omit to play audio\n");
     fprintf(stderr, "  -r, --reference <wav>             Reference audio for voice clone\n");
     fprintf(stderr, "  --ref-text <text>                 Reference transcript for voice clone\n");
     fprintf(stderr, "  --x-vector-only                   Voice clone without reference_text\n");
     fprintf(stderr, "  --speaker <name>                  CustomVoice speaker\n");
-    fprintf(stderr, "  --instruct <text>                 Instruct text (1.7B CustomVoice / VoiceDesign)\n");
+    fprintf(stderr, "  --instruct <text>                 Instruct text (CustomVoice/VoiceDesign)\n");
     fprintf(stderr, "  -l, --language <lang>             auto,en,ru,zh,ja,ko,de,fr,es,it,pt,beijing_dialect,sichuan_dialect\n");
     fprintf(stderr, "  --temperature <v>                 Sampling temperature (default: 0.9)\n");
     fprintf(stderr, "  --top-k <n>                       Top-k (default: 50)\n");
@@ -178,28 +222,25 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --max-tokens <n>                  Max audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repetition-penalty <v>          Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  -j, --threads <n>                 Number of threads\n");
-    fprintf(stderr, "  --list-models                     Print loaded model IDs and exit\n");
     fprintf(stderr, "  -h, --help                        Show this help\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "Auto task routing:\n");
+    fprintf(stderr, "  - if --reference is set: voice_clone\n");
+    fprintf(stderr, "  - else if --speaker is set: custom_voice\n");
+    fprintf(stderr, "  - else if --instruct is set: voice_design (only when model is voice_design)\n");
+    fprintf(stderr, "  - else: plain synthesize\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s --tokenizer-12hz models/qwen3-tts-tokenizer-f16.gguf --load-17b-voice-design models-1.7B-v2/Qwen3-TTS-12Hz-1.7B-VoiceDesign --model 1.7b_voice_design --mode design -t \"Please speak slowly\" --instruct \"female voice, warm tone, calm pace\" -o design.wav\n", program);
-    fprintf(stderr, "  %s --tokenizer-12hz models/qwen3-tts-tokenizer-f16.gguf --load-06b-base models/Qwen3-TTS-12Hz-0.6B-Base --model 06b_base --mode voice -t \"Hello\" -r clone.wav --ref-text \"Hello\" -o clone_out.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/0.6b-base -mt models/gguf/tokenizer -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice -mt models/gguf/tokenizer -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design -mt models/gguf/tokenizer -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
-    std::string tokenizer_12hz_path;
-
-    std::string load_06b_base_dir;
-    std::string load_06b_custom_dir;
-    std::string load_17b_base_dir;
-    std::string load_17b_custom_dir;
-    std::string load_17b_design_dir;
-
-    std::string selected_model_name;
-    synth_mode mode = synth_mode::auto_mode;
-
+    std::string model_path_arg;
+    std::string tokenizer_path_arg;
     std::string text_input;
     std::string text;
     std::string output_file;
@@ -207,10 +248,8 @@ int main(int argc, char **argv) {
     std::string reference_text;
     std::string speaker;
     std::string instruct;
-    bool x_vector_only_mode = false;
-    bool list_models_only = false;
 
-    tts_common_params common_params;
+    qwen3_tts::tts_params params;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -218,57 +257,18 @@ int main(int argc, char **argv) {
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
-        } else if (arg == "--tokenizer-12hz") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing tokenizer-12hz value\n");
-                return 1;
-            }
-            tokenizer_12hz_path = argv[i];
-        } else if (arg == "--load-06b-base") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --load-06b-base value\n");
-                return 1;
-            }
-            load_06b_base_dir = argv[i];
-        } else if (arg == "--load-06b-custom-voice") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --load-06b-custom-voice value\n");
-                return 1;
-            }
-            load_06b_custom_dir = argv[i];
-        } else if (arg == "--load-17b-base") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --load-17b-base value\n");
-                return 1;
-            }
-            load_17b_base_dir = argv[i];
-        } else if (arg == "--load-17b-custom-voice") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --load-17b-custom-voice value\n");
-                return 1;
-            }
-            load_17b_custom_dir = argv[i];
-        } else if (arg == "--load-17b-voice-design") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --load-17b-voice-design value\n");
-                return 1;
-            }
-            load_17b_design_dir = argv[i];
-        } else if (arg == "--model") {
+        } else if (arg == "-m" || arg == "--model") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --model value\n");
                 return 1;
             }
-            selected_model_name = argv[i];
-        } else if (arg == "--mode") {
+            model_path_arg = argv[i];
+        } else if (arg == "-mt" || arg == "--model-tokenizer") {
             if (++i >= argc) {
-                fprintf(stderr, "Error: missing --mode value\n");
+                fprintf(stderr, "Error: missing --model-tokenizer value\n");
                 return 1;
             }
-            if (!parse_mode(argv[i], mode)) {
-                fprintf(stderr, "Error: invalid mode '%s'\n", argv[i]);
-                return 1;
-            }
+            tokenizer_path_arg = argv[i];
         } else if (arg == "-t" || arg == "--text") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --text value\n");
@@ -294,7 +294,7 @@ int main(int argc, char **argv) {
             }
             reference_text = argv[i];
         } else if (arg == "--x-vector-only") {
-            x_vector_only_mode = true;
+            params.x_vector_only_mode = true;
         } else if (arg == "--speaker") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --speaker value\n");
@@ -317,45 +317,43 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: unsupported language '%s'\n", argv[i]);
                 return 1;
             }
-            common_params.language_id = language_id;
+            params.language_id = language_id;
         } else if (arg == "--temperature") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --temperature value\n");
                 return 1;
             }
-            common_params.temperature = std::stof(argv[i]);
+            params.temperature = std::stof(argv[i]);
         } else if (arg == "--top-k") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --top-k value\n");
                 return 1;
             }
-            common_params.top_k = std::stoi(argv[i]);
+            params.top_k = std::stoi(argv[i]);
         } else if (arg == "--top-p") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --top-p value\n");
                 return 1;
             }
-            common_params.top_p = std::stof(argv[i]);
+            params.top_p = std::stof(argv[i]);
         } else if (arg == "--max-tokens") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --max-tokens value\n");
                 return 1;
             }
-            common_params.max_audio_tokens = std::stoi(argv[i]);
+            params.max_audio_tokens = std::stoi(argv[i]);
         } else if (arg == "--repetition-penalty") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --repetition-penalty value\n");
                 return 1;
             }
-            common_params.repetition_penalty = std::stof(argv[i]);
+            params.repetition_penalty = std::stof(argv[i]);
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --threads value\n");
                 return 1;
             }
-            common_params.n_threads = std::stoi(argv[i]);
-        } else if (arg == "--list-models") {
-            list_models_only = true;
+            params.n_threads = std::stoi(argv[i]);
         } else {
             fprintf(stderr, "Error: unknown argument: %s\n", arg.c_str());
             print_usage(argv[0]);
@@ -363,158 +361,93 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (load_06b_base_dir.empty() &&
-        load_06b_custom_dir.empty() &&
-        load_17b_base_dir.empty() &&
-        load_17b_custom_dir.empty() &&
-        load_17b_design_dir.empty()) {
-        fprintf(stderr, "Error: at least one --load-* option is required\n");
+    if (model_path_arg.empty()) {
+        fprintf(stderr, "Error: --model is required\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (tokenizer_path_arg.empty()) {
+        fprintf(stderr, "Error: --model-tokenizer is required\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (text_input.empty()) {
+        fprintf(stderr, "Error: --text is required\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    Qwen3TTSModelHub hub;
-    if (!tokenizer_12hz_path.empty()) {
-        fprintf(stderr, "Using shared Tokenizer-12Hz from: %s\n", tokenizer_12hz_path.c_str());
-        if (!hub.set_shared_tokenizer_12hz(tokenizer_12hz_path)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-
-    if (!load_06b_base_dir.empty()) {
-        fprintf(stderr, "Loading 06b_base from: %s\n", load_06b_base_dir.c_str());
-        if (!hub.load_models_06b_base(load_06b_base_dir)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-    if (!load_06b_custom_dir.empty()) {
-        fprintf(stderr, "Loading 06b_custom_voice from: %s\n", load_06b_custom_dir.c_str());
-        if (!hub.load_models_06b_custom_voice(load_06b_custom_dir)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-    if (!load_17b_base_dir.empty()) {
-        fprintf(stderr, "Loading 1.7b_base from: %s\n", load_17b_base_dir.c_str());
-        if (!hub.load_models_1_7b_base(load_17b_base_dir)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-    if (!load_17b_custom_dir.empty()) {
-        fprintf(stderr, "Loading 1.7b_custom_voice from: %s\n", load_17b_custom_dir.c_str());
-        if (!hub.load_models_1_7b_custom_voice(load_17b_custom_dir)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-    if (!load_17b_design_dir.empty()) {
-        fprintf(stderr, "Loading 1.7b_voice_design from: %s\n", load_17b_design_dir.c_str());
-        if (!hub.load_models_1_7b_voice_design(load_17b_design_dir)) {
-            fprintf(stderr, "Error: %s\n", hub.get_error().c_str());
-            return 1;
-        }
-    }
-
-    print_loaded_models(hub);
-    if (list_models_only) {
-        return 0;
-    }
-
-    if (selected_model_name.empty()) {
-        std::vector<tts_model_id> loaded = hub.loaded_models();
-        if (loaded.size() == 1) {
-            selected_model_name = model_id_name(loaded.front());
-            fprintf(stderr, "Auto-selected model: %s\n", selected_model_name.c_str());
-        } else {
-            fprintf(stderr, "Error: --model is required when multiple models are loaded\n");
-            return 1;
-        }
-    }
-
-    tts_model_id model_id = tts_model_id::model_06b_base;
-    if (!parse_model_id(selected_model_name, model_id)) {
-        fprintf(stderr, "Error: unsupported --model value '%s'\n", selected_model_name.c_str());
-        return 1;
-    }
-    if (!hub.is_model_loaded(model_id)) {
-        fprintf(stderr, "Error: selected model is not loaded: %s\n", selected_model_name.c_str());
-        return 1;
-    }
-
-    if (text_input.empty()) {
-        fprintf(stderr, "Error: --text is required\n");
-        return 1;
-    }
     if (!load_text_or_file(text_input, text) || text.empty()) {
         fprintf(stderr, "Error: failed to load text from --text argument\n");
         return 1;
     }
 
-    if (mode == synth_mode::auto_mode) {
-        switch (model_id) {
-            case tts_model_id::model_06b_base:
-            case tts_model_id::model_1_7b_base:
-                mode = synth_mode::voice_clone;
-                break;
-            case tts_model_id::model_06b_custom_voice:
-            case tts_model_id::model_1_7b_custom_voice:
-                mode = instruct.empty() ? synth_mode::custom_voice : synth_mode::custom_voice_instruct;
-                break;
-            case tts_model_id::model_1_7b_voice_design:
-                mode = synth_mode::voice_design;
-                break;
-        }
+    std::string model_path;
+    std::string tokenizer_path;
+    std::string resolve_error;
+
+    if (!resolve_gguf_path(model_path_arg, false, model_path, resolve_error)) {
+        fprintf(stderr, "Error: %s\n", resolve_error.c_str());
+        return 1;
+    }
+    if (!resolve_gguf_path(tokenizer_path_arg, true, tokenizer_path, resolve_error)) {
+        fprintf(stderr, "Error: %s\n", resolve_error.c_str());
+        return 1;
     }
 
-    tts_result result;
-    if (mode == synth_mode::voice_clone) {
-        if (reference_audio.empty()) {
-            fprintf(stderr, "Error: voice mode requires --reference\n");
-            return 1;
-        }
-        tts_voice_clone_params p;
-        p.common = common_params;
-        p.reference_text = reference_text;
-        p.x_vector_only_mode = x_vector_only_mode;
+    qwen3_tts::Qwen3TTS tts;
+    fprintf(stderr, "Loading model: %s\n", model_path.c_str());
+    fprintf(stderr, "Loading tokenizer: %s\n", tokenizer_path.c_str());
 
-        result = hub.synthesize_with_voice(model_id, text, reference_audio, p);
-    } else if (mode == synth_mode::custom_voice) {
-        tts_custom_voice_params p;
-        p.common = common_params;
-        p.speaker = speaker;
-
-        if (model_id == tts_model_id::model_06b_custom_voice) {
-            result = hub.synthesize_06b_custom_voice(text, p);
-        } else if (model_id == tts_model_id::model_1_7b_custom_voice) {
-            result = hub.synthesize_1_7b_custom_voice(text, p);
-        } else {
-            fprintf(stderr, "Error: custom mode only supports CustomVoice models\n");
-            return 1;
-        }
-    } else if (mode == synth_mode::custom_voice_instruct) {
-        if (instruct.empty()) {
-            fprintf(stderr, "Error: custom_instruct mode requires --instruct\n");
-            return 1;
-        }
-        tts_custom_voice_params p;
-        p.common = common_params;
-        p.speaker = speaker;
-        result = hub.synthesize_with_instruct(model_id, text, instruct, p);
-    } else if (mode == synth_mode::voice_design) {
-        if (model_id != tts_model_id::model_1_7b_voice_design) {
-            fprintf(stderr, "Error: design mode only supports 1.7b_voice_design\n");
-            return 1;
-        }
-        tts_voice_design_params p;
-        p.common = common_params;
-        p.instruct = instruct;
-        result = hub.synthesize_1_7b_voice_design(text, p);
-    } else {
-        fprintf(stderr, "Error: unknown mode\n");
+    if (!tts.load_models_from_files(model_path, tokenizer_path)) {
+        fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
+    }
+
+    qwen3_tts::tts_model_variant variant = tts.loaded_model_variant();
+    if (variant == qwen3_tts::tts_model_variant::auto_variant) {
+        variant = infer_model_variant_from_path(model_path);
+    }
+    fprintf(stderr, "Loaded variant: %s\n", variant_name(variant));
+
+    qwen3_tts::tts_result result;
+
+    if (!reference_audio.empty()) {
+        params.task_type = qwen3_tts::tts_task_type::voice_clone;
+        params.reference_text = reference_text;
+        params.instruct.clear();
+        params.speaker.clear();
+
+        if (!params.x_vector_only_mode && params.reference_text.empty()) {
+            fprintf(stderr, "Error: voice clone requires --ref-text unless --x-vector-only is set\n");
+            return 1;
+        }
+
+        result = tts.synthesize_with_voice(text, reference_audio, params);
+    } else if (!speaker.empty()) {
+        params.task_type = qwen3_tts::tts_task_type::custom_voice;
+        params.speaker = speaker;
+        params.instruct = instruct;
+        result = tts.synthesize(text, params);
+    } else if (!instruct.empty()) {
+        if (variant != qwen3_tts::tts_model_variant::voice_design) {
+            fprintf(stderr, "Error: instruct-only mode requires a voice_design model, or provide --speaker\n");
+            return 1;
+        }
+        params.task_type = qwen3_tts::tts_task_type::voice_design;
+        params.instruct = instruct;
+        result = tts.synthesize(text, params);
+    } else {
+        if (variant == qwen3_tts::tts_model_variant::custom_voice) {
+            fprintf(stderr, "Error: custom_voice model requires --speaker\n");
+            return 1;
+        }
+        if (variant == qwen3_tts::tts_model_variant::voice_design) {
+            fprintf(stderr, "Error: voice_design model requires --instruct\n");
+            return 1;
+        }
+        params.task_type = qwen3_tts::tts_task_type::auto_task;
+        result = tts.synthesize(text, params);
     }
 
     if (!result.success) {
@@ -537,8 +470,7 @@ int main(int argc, char **argv) {
 
     fprintf(
         stderr,
-        "Done. model=%s, sample_rate=%d, samples=%zu, audio_sec=%.2f\n",
-        model_id_name(model_id),
+        "Done. sample_rate=%d, samples=%zu, audio_sec=%.2f\n",
         result.sample_rate,
         result.audio.size(),
         result.sample_rate > 0 ? (double)result.audio.size() / (double)result.sample_rate : 0.0

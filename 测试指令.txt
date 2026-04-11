@@ -1,3 +1,50 @@
-build\Release\qwen3-tts-cli.exe  -m ./models-1.7B-v2 -t "Son of bitch." --instruct "" --task voice_design --model-variant voice_design 
-build\Release\qwen3-tts-cli.exe  -m ./models-1.7B-v2 -t "text/test5.txt" --instruct "" --task voice_design --model-variant voice_design 
-build\Release\qwen3-tts-cli.exe -m models-1.7B-v2 -t "text/test3.txt" --task custom_voice --model-variant custom_voice --speaker Ryan --instruct "Very, very low bass"
+qwen3-tts-cli 简化版测试指令（基于 models/gguf）
+
+说明：
+1) 先进入仓库根目录 F:\qwen3-tts.cpp
+2) 下列命令在 PowerShell 执行
+3) 统一 tokenizer 路径：models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf
+4) 参考音频示例：examples\readme_clone_input.wav
+
+准备输出目录：
+New-Item -ItemType Directory -Force .\outputs | Out-Null
+
+--------------------------------------------------
+1) 0.6B Base - 声音克隆（ref + ref-text）
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\0.6b-base\qwen3-tts-12hz-0.6b-base-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "Hello, this is a 0.6B base voice clone test." -r .\examples\readme_clone_input.wav --ref-text "Hello, this is a short reference transcript." -o .\outputs\test_06b_base_clone.wav
+
+--------------------------------------------------
+2) 0.6B Base - x-vector only 克隆（无需 ref-text）
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\0.6b-base\qwen3-tts-12hz-0.6b-base-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "Hello, this is a 0.6B x-vector-only clone test." -r .\examples\readme_clone_input.wav --x-vector-only -o .\outputs\test_06b_base_xvector_only.wav
+
+--------------------------------------------------
+3) 0.6B CustomVoice - 预置音色（无 instruct）
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\0.6b-custom-voice\qwen3-tts-12hz-0.6b-custom-voice-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 0.6B custom voice test." --speaker ryan -o .\outputs\test_06b_custom_voice_ryan.wav
+
+--------------------------------------------------
+4) 1.7B Base - 声音克隆（ref + ref-text）
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-base\qwen3-tts-12hz-1.7b-base-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "Hello, this is a 1.7B base voice clone test." -r .\examples\readme_clone_input.wav --ref-text "Hello, this is a short reference transcript." -o .\outputs\test_17b_base_clone.wav
+
+--------------------------------------------------
+5) 1.7B CustomVoice - 预置音色（无 instruct）
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-custom-voice\qwen3-tts-12hz-1.7b-custom-voice-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 1.7B custom voice test." --speaker serena -o .\outputs\test_17b_custom_voice_serena.wav
+
+--------------------------------------------------
+6) 1.7B CustomVoice - 预置音色 + instruct
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-custom-voice\qwen3-tts-12hz-1.7b-custom-voice-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 1.7B custom voice plus instruct test." --speaker ryan --instruct "Speak with strong excitement and a bright tone." -o .\outputs\test_17b_custom_voice_ryan_instruct.wav
+
+--------------------------------------------------
+7) 1.7B VoiceDesign - instruct 设计音色
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-voice-design\qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 1.7B voice design test." --instruct "Female voice, warm timbre, calm and reassuring." -o .\outputs\test_17b_voice_design_warm.wav
+
+--------------------------------------------------
+8) 1.7B VoiceDesign - 中文 + 语言指定
+--------------------------------------------------
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-voice-design\qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "这是一个中文语音设计测试。" --instruct "女声，温柔，语速稍慢，情绪稳定。" -l zh -o .\outputs\test_17b_voice_design_zh.wav

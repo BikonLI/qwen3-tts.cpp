@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-One-shot model setup for qwen3-tts.cpp.
+Download and convert Qwen3-TTS model family for qwen3-tts.cpp.
 
-This script downloads required Hugging Face model assets and generates all model
-artifacts needed by the final C++ pipeline:
+Defaults:
+- Download ALL Qwen3-TTS 12Hz model variants
+- Convert to F16 GGUF
+- Root output directory: ./models
+- Always ensure tokenizer GGUF exists (download/convert unless already present)
 
-- models/qwen3-tts-0.6b-f16.gguf
-- models/qwen3-tts-tokenizer-f16.gguf
-- models/coreml/code_predictor.mlpackage (optional, macOS)
-
-Example:
+Examples:
   python scripts/setup_pipeline_models.py
-
-Minimal usage for CI/offline conversion:
-  python scripts/setup_pipeline_models.py --skip-download
+  python scripts/setup_pipeline_models.py --models 0.6b-base 1.7b-custom-voice --quant q8_0
+  python scripts/setup_pipeline_models.py --models all --quant q4_k --force
 """
 
 from __future__ import annotations
@@ -21,10 +19,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
-import platform
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -32,12 +30,92 @@ from typing import Iterable, Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 
-BASE_REPO_IDS = [
-    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-    "Qwen/Qwen3-TTS-0.6B-Base",
-]
-TOKENIZER_REPO_IDS = [
+
+@dataclass(frozen=True)
+class ModelSpec:
+    key: str
+    repo_ids: tuple[str, ...]
+    source_dir_name: str
+    gguf_subdir: str
+    gguf_stem: str
+
+
+MODEL_SPECS: dict[str, ModelSpec] = {
+    "0.6b-base": ModelSpec(
+        key="0.6b-base",
+        repo_ids=(
+            "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "Qwen/Qwen3-TTS-0.6B-Base",
+        ),
+        source_dir_name="Qwen3-TTS-12Hz-0.6B-Base",
+        gguf_subdir="gguf/0.6b-base",
+        gguf_stem="qwen3-tts-12hz-0.6b-base",
+    ),
+    "0.6b-custom-voice": ModelSpec(
+        key="0.6b-custom-voice",
+        repo_ids=(
+            "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        ),
+        source_dir_name="Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        gguf_subdir="gguf/0.6b-custom-voice",
+        gguf_stem="qwen3-tts-12hz-0.6b-custom-voice",
+    ),
+    "1.7b-base": ModelSpec(
+        key="1.7b-base",
+        repo_ids=(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        ),
+        source_dir_name="Qwen3-TTS-12Hz-1.7B-Base",
+        gguf_subdir="gguf/1.7b-base",
+        gguf_stem="qwen3-tts-12hz-1.7b-base",
+    ),
+    "1.7b-custom-voice": ModelSpec(
+        key="1.7b-custom-voice",
+        repo_ids=(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        ),
+        source_dir_name="Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        gguf_subdir="gguf/1.7b-custom-voice",
+        gguf_stem="qwen3-tts-12hz-1.7b-custom-voice",
+    ),
+    "1.7b-voice-design": ModelSpec(
+        key="1.7b-voice-design",
+        repo_ids=(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        ),
+        source_dir_name="Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        gguf_subdir="gguf/1.7b-voice-design",
+        gguf_stem="qwen3-tts-12hz-1.7b-voice-design",
+    ),
+}
+
+TOKENIZER_REPO_IDS = (
     "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+)
+
+TOKENIZER_SOURCE_DIR = "Qwen3-TTS-Tokenizer-12Hz"
+TOKENIZER_GGUF_SUBDIR = "gguf/tokenizer"
+TOKENIZER_GGUF_STEM = "qwen3-tts-tokenizer-12hz"
+
+TTS_ALLOW_PATTERNS = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "*.safetensors",
+    "*.safetensors.index.json",
+]
+
+TOKENIZER_ALLOW_PATTERNS = [
+    "config.json",
+    "configuration.json",
+    "preprocessor_config.json",
+    "*.safetensors",
+    "*.safetensors.index.json",
+    "speech_tokenizer/*.safetensors",
+    "speech_tokenizer/*.json",
 ]
 
 
@@ -45,271 +123,308 @@ def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def run_cmd(cmd: list[str], cwd: Path, env: Optional[dict[str, str]] = None) -> None:
-    eprint(f"[run] {' '.join(cmd)}")
-    subprocess.run(cmd, cwd=str(cwd), check=True, env=env)
-
-
 def has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
 def require_modules(modules: Iterable[tuple[str, str]]) -> None:
-    missing = [f"{name} ({pip_name})" for name, pip_name in modules if not has_module(name)]
-    if missing:
-        raise RuntimeError(
-            "Missing required Python modules: "
-            + ", ".join(missing)
-            + "\nInstall them, for example:\n"
-            + f"  {sys.executable} -m pip install "
-            + " ".join(pip_name for _, pip_name in modules)
-        )
+    missing = [f"{mod} ({pip_name})" for mod, pip_name in modules if not has_module(mod)]
+    if not missing:
+        return
+    pip_list = " ".join(pip_name for _, pip_name in modules)
+    raise RuntimeError(
+        "Missing Python modules: " + ", ".join(missing) + "\n"
+        + "Install with:\n"
+        + f"  {sys.executable} -m pip install {pip_list}"
+    )
 
 
-def snapshot_download_repo(
-    repo_ids: list[str],
+def run_cmd(cmd: list[str], cwd: Path) -> None:
+    eprint("[run] " + " ".join(cmd))
+    subprocess.run(cmd, cwd=str(cwd), check=True)
+
+
+def download_repo(
+    repo_ids: tuple[str, ...],
     local_dir: Path,
-    token: Optional[str],
+    hf_token: Optional[str],
     allow_patterns: Optional[list[str]],
 ) -> None:
     from huggingface_hub import snapshot_download
 
     local_dir.mkdir(parents=True, exist_ok=True)
     last_err: Optional[Exception] = None
+
     for repo_id in repo_ids:
         try:
             eprint(f"[download] {repo_id} -> {local_dir}")
             snapshot_download(
                 repo_id=repo_id,
                 local_dir=str(local_dir),
-                token=token,
+                token=hf_token,
                 allow_patterns=allow_patterns,
                 resume_download=True,
             )
             return
-        except Exception as err:
+        except Exception as err:  # pragma: no cover
             last_err = err
-            eprint(f"[warn] failed to download {repo_id}: {err}")
+            eprint(f"[warn] failed {repo_id}: {err}")
 
     if last_err is not None:
         raise last_err
-    raise RuntimeError("No model repositories configured")
+    raise RuntimeError("No valid repository ID was provided")
 
 
-def ensure_base_assets(base_dir: Path, token: Optional[str], force_download: bool) -> None:
-    required = [
-        base_dir / "config.json",
-        base_dir / "model.safetensors",
-        base_dir / "vocab.json",
-        base_dir / "merges.txt",
-        base_dir / "tokenizer_config.json",
-    ]
-
-    if force_download and base_dir.exists():
-        eprint(f"[clean] removing {base_dir}")
-        shutil.rmtree(base_dir)
-
-    if all(p.exists() for p in required):
-        eprint(f"[ok] base assets already present in {base_dir}")
-        return
-
-    allow_patterns = [
-        "config.json",
-        "generation_config.json",
-        "model.safetensors",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "preprocessor_config.json",
-        "speech_tokenizer/*",
-    ]
-    snapshot_download_repo(BASE_REPO_IDS, base_dir, token, allow_patterns)
-
-
-def ensure_tokenizer_assets(
-    base_dir: Path,
-    tokenizer_dir: Path,
-    token: Optional[str],
+def ensure_source_dir(
+    label: str,
+    repo_ids: tuple[str, ...],
+    source_dir: Path,
+    allow_patterns: list[str],
+    skip_download: bool,
     force_download: bool,
-) -> Path:
-    # Prefer the speech_tokenizer assets from base repo when present.
-    in_base = base_dir / "speech_tokenizer" / "model.safetensors"
-    if in_base.exists():
-        eprint("[ok] using tokenizer assets from base repo (speech_tokenizer/)")
-        return base_dir
-
-    if force_download and tokenizer_dir.exists():
-        eprint(f"[clean] removing {tokenizer_dir}")
-        shutil.rmtree(tokenizer_dir)
-
-    req_tok = [tokenizer_dir / "config.json", tokenizer_dir / "model.safetensors"]
-    if not all(p.exists() for p in req_tok):
-        allow_patterns = [
-            "config.json",
-            "configuration.json",
-            "model.safetensors",
-            "preprocessor_config.json",
-        ]
-        snapshot_download_repo(TOKENIZER_REPO_IDS, tokenizer_dir, token, allow_patterns)
-
-    return tokenizer_dir
-
-
-def convert_gguf(
-    python_exe: str,
-    base_dir: Path,
-    tokenizer_input_dir: Path,
-    out_tts: Path,
-    out_tok: Path,
-    force_convert: bool,
+    hf_token: Optional[str],
 ) -> None:
-    require_modules(
-        [
-            ("gguf", "gguf"),
-            ("torch", "torch"),
-            ("safetensors", "safetensors"),
-            ("numpy", "numpy"),
-            ("tqdm", "tqdm"),
-        ]
-    )
+    if force_download and source_dir.exists():
+        eprint(f"[clean] remove {source_dir}")
+        shutil.rmtree(source_dir)
 
-    if force_convert and out_tts.exists():
-        out_tts.unlink()
-    if force_convert and out_tok.exists():
-        out_tok.unlink()
-
-    if not out_tts.exists():
-        run_cmd(
-            [
-                python_exe,
-                str(SCRIPTS_DIR / "convert_tts_to_gguf.py"),
-                "--input",
-                str(base_dir),
-                "--output",
-                str(out_tts),
-                "--type",
-                "f16",
-            ],
-            cwd=REPO_ROOT,
-        )
-    else:
-        eprint(f"[ok] exists: {out_tts}")
-
-    if not out_tok.exists():
-        run_cmd(
-            [
-                python_exe,
-                str(SCRIPTS_DIR / "convert_tokenizer_to_gguf.py"),
-                "--input",
-                str(tokenizer_input_dir),
-                "--output",
-                str(out_tok),
-                "--type",
-                "f16",
-            ],
-            cwd=REPO_ROOT,
-        )
-    else:
-        eprint(f"[ok] exists: {out_tok}")
-
-
-def export_coreml(
-    python_exe: str,
-    base_dir: Path,
-    out_coreml: Path,
-    force_convert: bool,
-) -> None:
-    require_modules(
-        [
-            ("coremltools", "coremltools"),
-            ("torch", "torch"),
-            ("safetensors", "safetensors"),
-            ("numpy", "numpy"),
-        ]
-    )
-
-    if force_convert and out_coreml.exists():
-        if out_coreml.is_dir():
-            shutil.rmtree(out_coreml)
-        else:
-            out_coreml.unlink()
-
-    if out_coreml.exists():
-        eprint(f"[ok] exists: {out_coreml}")
+    if source_dir.exists() and any(source_dir.glob("*.safetensors")):
+        eprint(f"[ok] {label} source exists: {source_dir}")
         return
 
-    out_coreml.parent.mkdir(parents=True, exist_ok=True)
+    if skip_download:
+        raise RuntimeError(
+            f"{label} source is missing and --skip-download is set: {source_dir}"
+        )
+
+    download_repo(repo_ids, source_dir, hf_token, allow_patterns)
+
+
+def gguf_output_path(models_dir: Path, subdir: str, stem: str, quant: str) -> Path:
+    return models_dir / subdir / f"{stem}-{quant}.gguf"
+
+
+def ensure_tts_gguf(
+    spec: ModelSpec,
+    source_dir: Path,
+    output_path: Path,
+    quant: str,
+    force_convert: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if force_convert and output_path.exists():
+        eprint(f"[clean] remove {output_path}")
+        output_path.unlink()
+
+    if output_path.exists():
+        eprint(f"[ok] exists: {output_path}")
+        return
+
     run_cmd(
         [
-            python_exe,
-            str(SCRIPTS_DIR / "convert_code_predictor_to_coreml.py"),
+            sys.executable,
+            str(SCRIPTS_DIR / "convert_tts_to_gguf.py"),
             "--input",
-            str(base_dir),
+            str(source_dir),
             "--output",
-            str(out_coreml),
+            str(output_path),
+            "--type",
+            quant,
         ],
         cwd=REPO_ROOT,
     )
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Download and prepare all runtime models for qwen3-tts.cpp")
-    p.add_argument("--models-dir", default=str(REPO_ROOT / "models"), help="Target models directory")
-    p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""), help="Hugging Face token (or set HF_TOKEN)")
-    p.add_argument("--skip-download", action="store_true", help="Skip model downloads")
-    p.add_argument("--skip-gguf", action="store_true", help="Skip GGUF conversion")
-    p.add_argument(
-        "--coreml",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help="CoreML export mode: auto=macOS only, on=force, off=disable",
+def ensure_tokenizer_gguf(
+    source_dir: Path,
+    output_path: Path,
+    quant: str,
+    force_convert: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if force_convert and output_path.exists():
+        eprint(f"[clean] remove {output_path}")
+        output_path.unlink()
+
+    if output_path.exists():
+        eprint(f"[ok] exists: {output_path}")
+        return
+
+    run_cmd(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "convert_tokenizer_to_gguf.py"),
+            "--input",
+            str(source_dir),
+            "--output",
+            str(output_path),
+            "--type",
+            quant,
+        ],
+        cwd=REPO_ROOT,
     )
-    p.add_argument("--force", action="store_true", help="Re-download/re-generate outputs")
-    return p.parse_args()
+
+
+def parse_selected_models(items: list[str]) -> list[ModelSpec]:
+    values: list[str] = []
+    for item in items:
+        values.extend(v.strip().lower() for v in item.split(",") if v.strip())
+
+    if not values or "all" in values:
+        return [MODEL_SPECS[k] for k in MODEL_SPECS]
+
+    out: list[ModelSpec] = []
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for key in values:
+        if key in seen:
+            continue
+        seen.add(key)
+        spec = MODEL_SPECS.get(key)
+        if spec is None:
+            unknown.append(key)
+        else:
+            out.append(spec)
+
+    if unknown:
+        valid = ", ".join(["all", *MODEL_SPECS.keys()])
+        raise RuntimeError(f"Unknown --models value: {', '.join(unknown)}. Valid: {valid}")
+
+    return out
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download Qwen3-TTS model family and convert tensors to GGUF"
+    )
+    parser.add_argument(
+        "--models-dir",
+        default=str(REPO_ROOT / "models"),
+        help="Root models directory (default: ./models)",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=["all"],
+        help="Models to setup: all, 0.6b-base, 0.6b-custom-voice, 1.7b-base, 1.7b-custom-voice, 1.7b-voice-design",
+    )
+    parser.add_argument(
+        "--quant",
+        choices=["f16", "f32", "q8_0", "q4_k"],
+        default="f16",
+        help="GGUF quantization/output type",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=os.environ.get("HF_TOKEN", ""),
+        help="Hugging Face token (or set HF_TOKEN)",
+    )
+    parser.add_argument("--skip-download", action="store_true", help="Do not download from Hugging Face")
+    parser.add_argument("--skip-convert", action="store_true", help="Do not run GGUF conversion")
+    parser.add_argument("--force-download", action="store_true", help="Force re-download sources")
+    parser.add_argument("--force-convert", action="store_true", help="Force regenerate GGUF files")
+    parser.add_argument("--force", action="store_true", help="Equivalent to --force-download --force-convert")
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    models_dir = Path(args.models_dir).resolve()
-    base_dir = models_dir / "Qwen3-TTS-12Hz-0.6B-Base"
-    tokenizer_dir = models_dir / "Qwen3-TTS-Tokenizer-12Hz"
-    out_tts = models_dir / "qwen3-tts-0.6b-f16.gguf"
-    out_tok = models_dir / "qwen3-tts-tokenizer-f16.gguf"
-    out_coreml = models_dir / "coreml" / "code_predictor.mlpackage"
+    if args.force:
+        args.force_download = True
+        args.force_convert = True
 
+    models_dir = Path(args.models_dir).resolve()
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_specs = parse_selected_models(args.models)
     hf_token = args.hf_token.strip() or None
 
-    models_dir.mkdir(parents=True, exist_ok=True)
+    eprint("[config]")
+    eprint(f"  models_dir: {models_dir}")
+    eprint(f"  quant:      {args.quant}")
+    eprint(f"  models:     {', '.join(spec.key for spec in selected_specs)}")
+
+    # Tokenizer is mandatory for runtime; always ensure it exists.
+    tokenizer_source = models_dir / TOKENIZER_SOURCE_DIR
+    tokenizer_gguf = gguf_output_path(models_dir, TOKENIZER_GGUF_SUBDIR, TOKENIZER_GGUF_STEM, args.quant)
 
     if not args.skip_download:
         require_modules([("huggingface_hub", "huggingface_hub")])
-        ensure_base_assets(base_dir, hf_token, args.force)
-        tokenizer_input_dir = ensure_tokenizer_assets(base_dir, tokenizer_dir, hf_token, args.force)
+
+    if not args.skip_download or not tokenizer_source.exists():
+        ensure_source_dir(
+            label="Tokenizer",
+            repo_ids=TOKENIZER_REPO_IDS,
+            source_dir=tokenizer_source,
+            allow_patterns=TOKENIZER_ALLOW_PATTERNS,
+            skip_download=args.skip_download,
+            force_download=args.force_download,
+            hf_token=hf_token,
+        )
+
+    # Download selected TTS model sources.
+    tts_sources: dict[str, Path] = {}
+    for spec in selected_specs:
+        source_dir = models_dir / spec.source_dir_name
+        ensure_source_dir(
+            label=spec.key,
+            repo_ids=spec.repo_ids,
+            source_dir=source_dir,
+            allow_patterns=TTS_ALLOW_PATTERNS,
+            skip_download=args.skip_download,
+            force_download=args.force_download,
+            hf_token=hf_token,
+        )
+        tts_sources[spec.key] = source_dir
+
+    if not args.skip_convert:
+        require_modules(
+            [
+                ("gguf", "gguf"),
+                ("torch", "torch"),
+                ("safetensors", "safetensors"),
+                ("numpy", "numpy"),
+                ("tqdm", "tqdm"),
+            ]
+        )
+
+        # Tokenizer conversion is mandatory unless already available locally.
+        ensure_tokenizer_gguf(
+            source_dir=tokenizer_source,
+            output_path=tokenizer_gguf,
+            quant=args.quant,
+            force_convert=args.force_convert,
+        )
+
+        for spec in selected_specs:
+            out_path = gguf_output_path(models_dir, spec.gguf_subdir, spec.gguf_stem, args.quant)
+            ensure_tts_gguf(
+                spec=spec,
+                source_dir=tts_sources[spec.key],
+                output_path=out_path,
+                quant=args.quant,
+                force_convert=args.force_convert,
+            )
     else:
-        tokenizer_input_dir = base_dir if (base_dir / "speech_tokenizer" / "model.safetensors").exists() else tokenizer_dir
+        eprint("[skip] conversion disabled by --skip-convert")
 
-    if not args.skip_gguf:
-        convert_gguf(sys.executable, base_dir, tokenizer_input_dir, out_tts, out_tok, args.force)
+    eprint("\n[done] setup complete")
+    eprint(f"  tokenizer: {tokenizer_gguf}")
+    for spec in selected_specs:
+        out_path = gguf_output_path(models_dir, spec.gguf_subdir, spec.gguf_stem, args.quant)
+        eprint(f"  {spec.key}: {out_path}")
 
-    wants_coreml = args.coreml == "on" or (args.coreml == "auto" and platform.system() == "Darwin")
-    if wants_coreml:
-        if platform.system() != "Darwin":
-            raise RuntimeError("CoreML export requested on non-macOS platform")
-        export_coreml(sys.executable, base_dir, out_coreml, args.force)
-
-    eprint("\n[done] Model setup complete.")
-    eprint(f"  - {out_tts}")
-    eprint(f"  - {out_tok}")
-    if wants_coreml:
-        eprint(f"  - {out_coreml}")
-        eprint("\nRun (CoreML is enabled by default on macOS):")
-        eprint("  ./build/qwen3-tts-cli -m models -t \"Hello\" -o out.wav")
-        eprint("  # Optional override path:")
-        eprint("  QWEN3_TTS_COREML_MODEL=models/coreml/code_predictor.mlpackage ./build/qwen3-tts-cli -m models -t \"Hello\" -o out.wav")
-    else:
-        eprint("\nRun without CoreML:")
-        eprint("  ./build/qwen3-tts-cli -m models -t \"Hello\" -o out.wav")
+    eprint("\nExample load (new multi-model CLI):")
+    eprint(
+        "  build\\Release\\qwen3-tts-cli.exe "
+        + f"--tokenizer-12hz {tokenizer_gguf} "
+        + f"--load-17b-custom-voice {models_dir / 'gguf/1.7b-custom-voice'} "
+        + "--model 1.7b_custom_voice --mode custom_instruct "
+        + "--speaker ryan --instruct \"happy\" -t \"Hello\" -o out.wav"
+    )
 
     return 0
 

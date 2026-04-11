@@ -5,7 +5,7 @@ Convert Qwen3-TTS-Tokenizer-12Hz model to GGUF format.
 Usage:
     python scripts/convert_tokenizer_to_gguf.py \
         --input models/Qwen3-TTS-Tokenizer-12Hz \
-        --output models/qwen3-tts-tokenizer-f16.gguf \
+        --output models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf \
         --type f16
 """
 
@@ -295,6 +295,18 @@ class Qwen3TTSTokenizerConverter:
             except Exception as e:
                 logger.warning(f"Q8_0 quantization failed for {tensor_name}: {e}, falling back to F16")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+        elif self.output_type == "q4_k":
+            # Keep some tensors in F16 for quality/stability.
+            if any(x in tensor_name for x in ["codebook", "_norm", "norm.", "scale", "alpha", "beta"]):
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+            data = data.astype(np.float32)
+            try:
+                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_K)
+                return quantized, gguf.GGMLQuantizationType.Q4_K
+            except Exception as e:
+                logger.warning(f"Q4_K quantization failed for {tensor_name}: {e}, falling back to F16")
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         else:
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
 
@@ -400,6 +412,8 @@ class Qwen3TTSTokenizerConverter:
             ftype = gguf.LlamaFileType.MOSTLY_F16
         elif self.output_type == "q8_0":
             ftype = gguf.LlamaFileType.MOSTLY_Q8_0
+        elif self.output_type == "q4_k":
+            ftype = gguf.LlamaFileType.MOSTLY_Q4_K_M
         else:
             ftype = gguf.LlamaFileType.MOSTLY_F16
         writer.add_file_type(ftype)
@@ -453,7 +467,7 @@ def main():
     )
     parser.add_argument(
         "--type", "-t",
-        choices=["f16", "f32", "q8_0"],
+        choices=["f16", "f32", "q8_0", "q4_k"],
         default="f16",
         help="Output data type (default: f16)"
     )

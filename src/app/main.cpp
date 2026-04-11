@@ -415,6 +415,9 @@ int main(int argc, char **argv) {
     if (!reference_audio.empty()) {
         params.task_type = qwen3_tts::tts_task_type::voice_clone;
         params.reference_text = reference_text;
+        if (!instruct.empty()) {
+            fprintf(stderr, "Warning: --instruct is ignored in voice_clone mode (--reference provided).\n");
+        }
         params.instruct.clear();
         params.speaker.clear();
 

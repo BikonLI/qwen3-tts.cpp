@@ -43,6 +43,7 @@ New-Item -ItemType Directory -Force .\outputs | Out-Null
 7) 1.7B VoiceDesign - instruct 设计音色
 --------------------------------------------------
 .\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-voice-design\qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 1.7B voice design test." --instruct "Female voice, warm timbre, calm and reassuring." -o .\outputs\test_17b_voice_design_warm.wav
+.\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-voice-design\qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "This is a 1.7B voice design test." --instruct "male voice, warm timbre, calm and reassuring." -o .\outputs\test_17b_voice_design_warm.wav
 
 --------------------------------------------------
 8) 1.7B VoiceDesign - 中文 + 语言指定

@@ -88,6 +88,10 @@ namespace qwen3_tts {
         }
     }
 
+    static bool is_supported_custom_voice_speaker(const std::string &speaker_lower);
+    static bool map_custom_voice_speaker_codec_id(const std::string &speaker_lower, int32_t &codec_id_out);
+    static int32_t map_dialect_language_if_needed(const std::string &speaker_lower, int32_t language_id);
+
     static std::string pick_first_sorted(std::vector<std::string> &v) {
         if (v.empty()) {
             return {};
@@ -640,6 +644,28 @@ namespace qwen3_tts {
             return result;
         }
 
+        int32_t effective_language_id = params.language_id;
+        int32_t speaker_codec_id = -1;
+        const bool use_custom_voice_speaker =
+            (params.task_type == tts_task_type::custom_voice ||
+             effective_variant == tts_model_variant::custom_voice);
+        if (use_custom_voice_speaker) {
+            const std::string speaker_lower = to_lower_copy(params.speaker);
+            if (speaker_lower.empty()) {
+                result.error_msg = "speaker is required for custom_voice";
+                return result;
+            }
+            if (!is_supported_custom_voice_speaker(speaker_lower)) {
+                result.error_msg = "Unsupported speaker: " + params.speaker;
+                return result;
+            }
+            if (!map_custom_voice_speaker_codec_id(speaker_lower, speaker_codec_id)) {
+                result.error_msg = "Unsupported speaker: " + params.speaker;
+                return result;
+            }
+            effective_language_id = map_dialect_language_if_needed(speaker_lower, effective_language_id);
+        }
+
         int64_t t_total_start = get_time_ms();
         auto sample_memory = [&](const char *stage) {
             process_memory_snapshot mem;
@@ -711,10 +737,17 @@ namespace qwen3_tts {
         }
         transformer_.clear_kv_cache();
 
+        const float * generation_speaker_embedding = speaker_embedding;
+        if (speaker_codec_id >= 0) {
+            generation_speaker_embedding = nullptr;
+        }
+
         std::vector<int32_t> speech_codes;
         if (!transformer_.generate(
-                text_tokens.data(), (int32_t)text_tokens.size(), speaker_embedding, params.max_audio_tokens,
-                speech_codes, params.language_id, params.repetition_penalty, params.temperature, params.top_k,
+            text_tokens.data(), (int32_t)text_tokens.size(), generation_speaker_embedding,
+            params.max_audio_tokens,
+            speech_codes, effective_language_id, speaker_codec_id,
+            params.repetition_penalty, params.temperature, params.top_k,
                 params.top_p,
                 instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                 (int32_t)instruct_tokens.size()
@@ -823,16 +856,34 @@ namespace qwen3_tts {
         return result;
     }
 
-    static bool is_supported_custom_voice_speaker(const std::string &speaker_lower) {
-        static const char *kSpeakers[] = {
-            "vivian", "serena", "uncle_fu", "dylan", "eric", "ryan", "aiden", "ono_anna", "sohee"
+    static bool map_custom_voice_speaker_codec_id(const std::string &speaker_lower, int32_t &codec_id_out) {
+        struct speaker_codec_item {
+            const char *name;
+            int32_t codec_id;
         };
-        for (const char *name : kSpeakers) {
-            if (speaker_lower == name) {
+        static const speaker_codec_item kSpeakerCodecMap[] = {
+            { "vivian", 3065 },
+            { "serena", 3066 },
+            { "uncle_fu", 3010 },
+            { "dylan", 2878 },
+            { "eric", 2875 },
+            { "ryan", 3061 },
+            { "aiden", 2861 },
+            { "ono_anna", 2873 },
+            { "sohee", 2864 },
+        };
+        for (const speaker_codec_item &item : kSpeakerCodecMap) {
+            if (speaker_lower == item.name) {
+                codec_id_out = item.codec_id;
                 return true;
             }
         }
         return false;
+    }
+
+    static bool is_supported_custom_voice_speaker(const std::string &speaker_lower) {
+        int32_t codec_id = -1;
+        return map_custom_voice_speaker_codec_id(speaker_lower, codec_id);
     }
 
     static int32_t map_dialect_language_if_needed(const std::string &speaker_lower, int32_t language_id) {

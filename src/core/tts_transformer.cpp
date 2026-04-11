@@ -1057,6 +1057,7 @@ bool TTSTransformer::project_text_tokens(const int32_t * text_tokens, int32_t n_
 bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
                                          const int32_t * instruct_tokens, int32_t n_instruct_tokens,
                                          const float * speaker_embd, int32_t language_id,
+                                         int32_t speaker_codec_id,
                                          std::vector<float> & prefill_embd,
                                          std::vector<float> & trailing_text_hidden,
                                          std::vector<float> & tts_pad_embed) {
@@ -1127,7 +1128,19 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         return false;
     }
 
-    const bool has_speaker = (speaker_embd != nullptr);
+    std::vector<float> speaker_codec_embed;
+    const float * speaker_row = nullptr;
+    if (speaker_embd != nullptr) {
+        speaker_row = speaker_embd;
+    } else if (speaker_codec_id >= 0) {
+        speaker_codec_embed.resize((size_t) hidden_size);
+        if (!lookup_single_embedding_row(model_.codec_embd, speaker_codec_id, speaker_codec_embed.data())) {
+            return false;
+        }
+        speaker_row = speaker_codec_embed.data();
+    }
+
+    const bool has_speaker = (speaker_row != nullptr);
     const int32_t codec_input_len = (int32_t)codec_prefill_tokens.size() + (has_speaker ? 1 : 0) + 2;
     std::vector<float> codec_input_embedding((size_t)codec_input_len * hidden_size);
 
@@ -1137,7 +1150,7 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
 
     if (has_speaker) {
         memcpy(codec_input_embedding.data() + (size_t)dst_token * hidden_size,
-               speaker_embd, hidden_size * sizeof(float));
+               speaker_row, hidden_size * sizeof(float));
         ++dst_token;
     }
 
@@ -2767,6 +2780,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                const float * speaker_embd, int32_t max_len,
                                std::vector<int32_t> & output,
                                int32_t language_id,
+                               int32_t speaker_codec_id,
                                float repetition_penalty,
                                float temperature,
                                int32_t top_k,
@@ -2809,7 +2823,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
     if (!build_prefill_graph(text_tokens, n_tokens,
                              instruct_tokens, n_instruct_tokens,
-                             speaker_embd, language_id,
+                             speaker_embd, language_id, speaker_codec_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed)) {
         return false;
     }
@@ -3068,7 +3082,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "\n  Embed lookups:      %8.1f ms   (%.1f ms/frame)\n", t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0);
     double accounted = t.t_prefill_build_ms + t.t_prefill_forward_ms + t.t_talker_forward_ms + t.t_code_pred_ms + t.t_embed_lookup_ms;
     fprintf(stderr, "  Other/overhead:     %8.1f ms\n", t.t_generate_total_ms - accounted);
-    fprintf(stderr, "  ─────────────────────────────────────────\n");
+    fprintf(stderr, "  -----------------------------------------\n");
     fprintf(stderr, "  Total generate:     %8.1f ms\n", t.t_generate_total_ms);
     if (nf > 0) {
         fprintf(stderr, "  Throughput:         %8.1f ms/frame (%.1f frames/s)\n",

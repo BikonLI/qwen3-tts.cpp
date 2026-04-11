@@ -266,13 +266,14 @@ public:
     
     // Generate speech codes autoregressively
     // text_tokens: input text token IDs [n_tokens]
-    // speaker_embd: speaker embedding [hidden_size]
+    // speaker_embd: speaker embedding [hidden_size] (voice clone path)
     // max_len: maximum number of frames to generate
     // output: generated speech codes [n_frames, n_codebooks]
     bool generate(const int32_t * text_tokens, int32_t n_tokens,
                   const float * speaker_embd, int32_t max_len,
                   std::vector<int32_t> & output,
                   int32_t language_id = -1,
+                  int32_t speaker_codec_id = -1,
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
                   int32_t top_k = 50,
@@ -304,6 +305,7 @@ private:
     bool build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
                              const int32_t * instruct_tokens, int32_t n_instruct_tokens,
                              const float * speaker_embd, int32_t language_id,
+                             int32_t speaker_codec_id,
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,
                              std::vector<float> & tts_pad_embed);

@@ -337,3 +337,11 @@ int main() {
 - ggml by ggml-org
 - WavTokenizer 相关工作
 - 原始仓库: https://github.com/predict-woo/qwen3-tts.cpp
+
+## GitHub Star 趋势图
+
+如果喜欢，那么给我一个**Star**!
+<a href="https://star-history.com/#BikonLI/qwen3-tts.cpp&Date">
+  <img alt="GitHub Star History Chart" src="https://api.star-history.com/svg?repos=BikonLI/qwen3-tts.cpp&type=Date" />
+</a>
+

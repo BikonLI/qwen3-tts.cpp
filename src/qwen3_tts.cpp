@@ -77,17 +77,33 @@ namespace qwen3_tts {
         }
     }
 
-    static bool discover_model_paths(const std::string &model_dir,
-                                     std::string &tts_model_path,
-                                     std::string &tokenizer_model_path,
-                                     std::string &error_msg) {
+    static const char *model_id_name(tts_model_id id) {
+        switch (id) {
+            case tts_model_id::model_06b_base: return "06b_base";
+            case tts_model_id::model_06b_custom_voice: return "06b_custom_voice";
+            case tts_model_id::model_1_7b_base: return "1.7b_base";
+            case tts_model_id::model_1_7b_custom_voice: return "1.7b_custom_voice";
+            case tts_model_id::model_1_7b_voice_design: return "1.7b_voice_design";
+            default: return "unknown";
+        }
+    }
+
+    static std::string pick_first_sorted(std::vector<std::string> &v) {
+        if (v.empty()) {
+            return {};
+        }
+        std::sort(v.begin(), v.end());
+        return v.front();
+    }
+
+    static bool discover_tts_model_path(const std::string &model_dir,
+                                        std::string &tts_model_path,
+                                        std::string &error_msg) {
         tts_model_path.clear();
-        tokenizer_model_path.clear();
 
         std::vector<std::string> q8_candidates;
         std::vector<std::string> f16_candidates;
         std::vector<std::string> fallback_tts;
-        std::vector<std::string> tokenizer_candidates;
 
         std::error_code ec;
         if (!fs::exists(model_dir, ec) || !fs::is_directory(model_dir, ec)) {
@@ -99,14 +115,12 @@ namespace qwen3_tts {
             if (!entry.is_regular_file()) {
                 continue;
             }
-            const std::string path = entry.path().string();
-            const std::string name = to_lower_copy(entry.path().filename().string());
             if (entry.path().extension().string() != ".gguf") {
                 continue;
             }
-
+            const std::string path = entry.path().string();
+            const std::string name = to_lower_copy(entry.path().filename().string());
             if (name.find("tokenizer") != std::string::npos) {
-                tokenizer_candidates.push_back(path);
                 continue;
             }
 
@@ -119,14 +133,6 @@ namespace qwen3_tts {
             }
         }
 
-        auto pick_first_sorted = [](std::vector<std::string> &v) -> std::string {
-            if (v.empty()) {
-                return {};
-            }
-            std::sort(v.begin(), v.end());
-            return v.front();
-        };
-
         if (!q8_candidates.empty()) {
             tts_model_path = pick_first_sorted(q8_candidates);
         } else if (!f16_candidates.empty()) {
@@ -135,12 +141,77 @@ namespace qwen3_tts {
             tts_model_path = pick_first_sorted(fallback_tts);
         }
 
-        tokenizer_model_path = pick_first_sorted(tokenizer_candidates);
-        if (tts_model_path.empty() || tokenizer_model_path.empty()) {
-            error_msg = "Failed to discover GGUF files in model dir. Need one TTS GGUF and one tokenizer GGUF.";
+        if (tts_model_path.empty()) {
+            error_msg = "Failed to discover TTS GGUF file in model dir: " + model_dir;
             return false;
         }
 
+        return true;
+    }
+
+    static bool discover_tokenizer_model_path(const std::string &tokenizer_path_or_dir,
+                                              std::string &tokenizer_model_path,
+                                              std::string &error_msg) {
+        tokenizer_model_path.clear();
+
+        std::error_code ec;
+        if (fs::exists(tokenizer_path_or_dir, ec) && fs::is_regular_file(tokenizer_path_or_dir, ec)) {
+            if (fs::path(tokenizer_path_or_dir).extension().string() != ".gguf") {
+                error_msg = "Tokenizer path is not a GGUF file: " + tokenizer_path_or_dir;
+                return false;
+            }
+            tokenizer_model_path = tokenizer_path_or_dir;
+            return true;
+        }
+
+        if (!fs::exists(tokenizer_path_or_dir, ec) || !fs::is_directory(tokenizer_path_or_dir, ec)) {
+            error_msg = "Tokenizer path does not exist: " + tokenizer_path_or_dir;
+            return false;
+        }
+
+        std::vector<std::string> tokenizer_candidates;
+        std::vector<std::string> fallback_gguf;
+        for (const auto &entry : fs::directory_iterator(tokenizer_path_or_dir, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            if (entry.path().extension().string() != ".gguf") {
+                continue;
+            }
+
+            const std::string path = entry.path().string();
+            const std::string name = to_lower_copy(entry.path().filename().string());
+            if (name.find("tokenizer") != std::string::npos) {
+                tokenizer_candidates.push_back(path);
+            } else {
+                fallback_gguf.push_back(path);
+            }
+        }
+
+        if (!tokenizer_candidates.empty()) {
+            tokenizer_model_path = pick_first_sorted(tokenizer_candidates);
+        } else {
+            tokenizer_model_path = pick_first_sorted(fallback_gguf);
+        }
+
+        if (tokenizer_model_path.empty()) {
+            error_msg = "Failed to discover tokenizer GGUF in: " + tokenizer_path_or_dir;
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool discover_model_paths(const std::string &model_dir,
+                                     std::string &tts_model_path,
+                                     std::string &tokenizer_model_path,
+                                     std::string &error_msg) {
+        if (!discover_tts_model_path(model_dir, tts_model_path, error_msg)) {
+            return false;
+        }
+        if (!discover_tokenizer_model_path(model_dir, tokenizer_model_path, error_msg)) {
+            return false;
+        }
         return true;
     }
 
@@ -240,22 +311,42 @@ namespace qwen3_tts {
     Qwen3TTS::~Qwen3TTS() = default;
 
     bool Qwen3TTS::load_models(const std::string &model_dir) {
-        int64_t t_start = get_time_ms();
-        log_memory_usage("load/start");
-
-        transformer_.unload_model();
-        audio_decoder_.unload_model();
-        transformer_loaded_ = false;
-        decoder_loaded_ = false;
-
         std::string tts_model_path;
         std::string tokenizer_model_path;
         if (!discover_model_paths(model_dir, tts_model_path, tokenizer_model_path, error_msg_)) {
             return false;
         }
+        return load_models_from_files(tts_model_path, tokenizer_model_path);
+    }
+
+    bool Qwen3TTS::load_models_from_files(const std::string &tts_model_path,
+                                          const std::string &tokenizer_model_path) {
+        int64_t t_start = get_time_ms();
+        log_memory_usage("load/start");
+
+        models_loaded_ = false;
+        transformer_.unload_model();
+        audio_decoder_.unload_model();
+        transformer_loaded_ = false;
+        decoder_loaded_ = false;
+        loaded_hidden_size_ = 0;
+
+        if (tts_model_path.empty() || tokenizer_model_path.empty()) {
+            error_msg_ = "Model path is empty";
+            return false;
+        }
+        if (!fs::exists(tts_model_path) || !fs::is_regular_file(tts_model_path)) {
+            error_msg_ = "TTS model file does not exist: " + tts_model_path;
+            return false;
+        }
+        if (!fs::exists(tokenizer_model_path) || !fs::is_regular_file(tokenizer_model_path)) {
+            error_msg_ = "Tokenizer model file does not exist: " + tokenizer_model_path;
+            return false;
+        }
+
         tts_model_path_ = tts_model_path;
         decoder_model_path_ = tokenizer_model_path;
-        loaded_model_variant_ = infer_model_variant_from_path(tts_model_path + " " + model_dir);
+        loaded_model_variant_ = infer_model_variant_from_path(tts_model_path);
         encoder_loaded_ = false;
         transformer_loaded_ = false;
         decoder_loaded_ = false;
@@ -305,6 +396,7 @@ namespace qwen3_tts {
             return false;
         }
         transformer_loaded_ = true;
+        loaded_hidden_size_ = transformer_.get_config().hidden_size;
         fprintf(
             stderr, "  TTS transformer loaded: hidden_size=%d, n_layers=%d (%lld ms)\n",
             transformer_.get_config().hidden_size, transformer_.get_config().n_layers,
@@ -722,6 +814,492 @@ namespace qwen3_tts {
 
     void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
         progress_callback_ = callback;
+    }
+
+    static tts_result make_error_result(const std::string &error_msg) {
+        tts_result result;
+        result.success = false;
+        result.error_msg = error_msg;
+        return result;
+    }
+
+    static bool is_supported_custom_voice_speaker(const std::string &speaker_lower) {
+        static const char *kSpeakers[] = {
+            "vivian", "serena", "uncle_fu", "dylan", "eric", "ryan", "aiden", "ono_anna", "sohee"
+        };
+        for (const char *name : kSpeakers) {
+            if (speaker_lower == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int32_t map_dialect_language_if_needed(const std::string &speaker_lower, int32_t language_id) {
+        const bool chinese_or_auto = (language_id < 0 || language_id == 2055);
+        if (!chinese_or_auto) {
+            return language_id;
+        }
+        if (speaker_lower == "dylan") {
+            return 2074; // beijing_dialect
+        }
+        if (speaker_lower == "eric") {
+            return 2062; // sichuan_dialect
+        }
+        return language_id;
+    }
+
+    struct Qwen3TTSModelHub::model_slot {
+        tts_model_id model_id = tts_model_id::model_06b_base;
+        tts_model_variant expected_variant = tts_model_variant::auto_variant;
+        int32_t expected_hidden_size = 0;
+        std::string model_dir;
+        std::string tts_model_path;
+        std::string tokenizer_model_path;
+        std::unique_ptr<Qwen3TTS> engine;
+    };
+
+    Qwen3TTSModelHub::Qwen3TTSModelHub() = default;
+
+    Qwen3TTSModelHub::~Qwen3TTSModelHub() = default;
+
+    bool Qwen3TTSModelHub::set_shared_tokenizer_12hz(const std::string &tokenizer_model_path_or_dir) {
+        std::string resolved;
+        if (!discover_tokenizer_model_path(tokenizer_model_path_or_dir, resolved, error_msg_)) {
+            return false;
+        }
+        shared_tokenizer_path_ = resolved;
+        return true;
+    }
+
+    bool Qwen3TTSModelHub::load_models_06b_base(const std::string &model_dir) {
+        return load_model_internal(
+            tts_model_id::model_06b_base,
+            model_dir,
+            tts_model_variant::base,
+            1024
+        );
+    }
+
+    bool Qwen3TTSModelHub::load_models_06b_custom_voice(const std::string &model_dir) {
+        return load_model_internal(
+            tts_model_id::model_06b_custom_voice,
+            model_dir,
+            tts_model_variant::custom_voice,
+            1024
+        );
+    }
+
+    bool Qwen3TTSModelHub::load_models_1_7b_base(const std::string &model_dir) {
+        return load_model_internal(
+            tts_model_id::model_1_7b_base,
+            model_dir,
+            tts_model_variant::base,
+            2048
+        );
+    }
+
+    bool Qwen3TTSModelHub::load_models_1_7b_custom_voice(const std::string &model_dir) {
+        return load_model_internal(
+            tts_model_id::model_1_7b_custom_voice,
+            model_dir,
+            tts_model_variant::custom_voice,
+            2048
+        );
+    }
+
+    bool Qwen3TTSModelHub::load_models_1_7b_voice_design(const std::string &model_dir) {
+        return load_model_internal(
+            tts_model_id::model_1_7b_voice_design,
+            model_dir,
+            tts_model_variant::voice_design,
+            2048
+        );
+    }
+
+    bool Qwen3TTSModelHub::unload_model(tts_model_id model_id) {
+        auto it = models_.find(model_id);
+        if (it == models_.end()) {
+            error_msg_ = std::string("Model is not loaded: ") + model_id_name(model_id);
+            return false;
+        }
+        models_.erase(it);
+        return true;
+    }
+
+    bool Qwen3TTSModelHub::is_model_loaded(tts_model_id model_id) const {
+        const model_slot *slot = find_slot(model_id);
+        return slot && slot->engine && slot->engine->is_loaded();
+    }
+
+    std::vector<tts_model_id> Qwen3TTSModelHub::loaded_models() const {
+        std::vector<tts_model_id> ids;
+        for (const auto &kv : models_) {
+            if (kv.second && kv.second->engine && kv.second->engine->is_loaded()) {
+                ids.push_back(kv.first);
+            }
+        }
+        return ids;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_06b_base_with_voice(
+        const std::string &text,
+        const std::string &reference_audio,
+        const tts_voice_clone_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_06b_base);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 0.6B Base";
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::voice_clone;
+        p.model_variant = tts_model_variant::base;
+        p.reference_text = params.reference_text;
+        p.x_vector_only_mode = params.x_vector_only_mode;
+
+        tts_result result = slot->engine->synthesize_with_voice(text, reference_audio, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_06b_base_with_embedding(
+        const std::string &text,
+        const float *embedding,
+        int32_t embedding_size,
+        const tts_common_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_06b_base);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 0.6B Base";
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params);
+        p.task_type = tts_task_type::voice_clone;
+        p.model_variant = tts_model_variant::base;
+        p.x_vector_only_mode = true;
+
+        tts_result result = slot->engine->synthesize_with_embedding(text, embedding, embedding_size, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_1_7b_base_with_voice(
+        const std::string &text,
+        const std::string &reference_audio,
+        const tts_voice_clone_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_1_7b_base);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 1.7B Base";
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::voice_clone;
+        p.model_variant = tts_model_variant::base;
+        p.reference_text = params.reference_text;
+        p.x_vector_only_mode = params.x_vector_only_mode;
+
+        tts_result result = slot->engine->synthesize_with_voice(text, reference_audio, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_1_7b_base_with_embedding(
+        const std::string &text,
+        const float *embedding,
+        int32_t embedding_size,
+        const tts_common_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_1_7b_base);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 1.7B Base";
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params);
+        p.task_type = tts_task_type::voice_clone;
+        p.model_variant = tts_model_variant::base;
+        p.x_vector_only_mode = true;
+
+        tts_result result = slot->engine->synthesize_with_embedding(text, embedding, embedding_size, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_06b_custom_voice(
+        const std::string &text,
+        const tts_custom_voice_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_06b_custom_voice);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 0.6B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+
+        std::string speaker = to_lower_copy(params.speaker);
+        if (speaker.empty()) {
+            error_msg_ = "speaker is required for 0.6B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+        if (!is_supported_custom_voice_speaker(speaker)) {
+            error_msg_ = "Unsupported speaker: " + params.speaker;
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::custom_voice;
+        p.model_variant = tts_model_variant::custom_voice;
+        p.speaker = speaker;
+        p.language_id = map_dialect_language_if_needed(speaker, p.language_id);
+
+        tts_result result = slot->engine->synthesize(text, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_1_7b_custom_voice(
+        const std::string &text,
+        const tts_custom_voice_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_1_7b_custom_voice);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 1.7B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+
+        std::string speaker = to_lower_copy(params.speaker);
+        if (speaker.empty()) {
+            error_msg_ = "speaker is required for 1.7B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+        if (!is_supported_custom_voice_speaker(speaker)) {
+            error_msg_ = "Unsupported speaker: " + params.speaker;
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::custom_voice;
+        p.model_variant = tts_model_variant::custom_voice;
+        p.speaker = speaker;
+        p.language_id = map_dialect_language_if_needed(speaker, p.language_id);
+
+        tts_result result = slot->engine->synthesize(text, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_1_7b_custom_voice_with_instruct(
+        const std::string &text,
+        const tts_custom_voice_instruct_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_1_7b_custom_voice);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 1.7B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+
+        std::string speaker = to_lower_copy(params.speaker);
+        if (speaker.empty()) {
+            error_msg_ = "speaker is required for 1.7B CustomVoice";
+            return make_error_result(error_msg_);
+        }
+        if (!is_supported_custom_voice_speaker(speaker)) {
+            error_msg_ = "Unsupported speaker: " + params.speaker;
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::custom_voice;
+        p.model_variant = tts_model_variant::custom_voice;
+        p.speaker = speaker;
+        p.instruct = params.instruct;
+        p.language_id = map_dialect_language_if_needed(speaker, p.language_id);
+
+        tts_result result = slot->engine->synthesize(text, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_1_7b_voice_design(
+        const std::string &text,
+        const tts_voice_design_params &params
+    ) {
+        model_slot *slot = find_slot(tts_model_id::model_1_7b_voice_design);
+        if (!slot || !slot->engine || !slot->engine->is_loaded()) {
+            error_msg_ = "Model not loaded: 1.7B VoiceDesign";
+            return make_error_result(error_msg_);
+        }
+
+        if (params.instruct.empty()) {
+            error_msg_ = "instruct is required for 1.7B VoiceDesign";
+            return make_error_result(error_msg_);
+        }
+
+        tts_params p = build_common_tts_params(params.common);
+        p.task_type = tts_task_type::voice_design;
+        p.model_variant = tts_model_variant::voice_design;
+        p.instruct = params.instruct;
+
+        tts_result result = slot->engine->synthesize(text, p);
+        if (!result.success) {
+            error_msg_ = result.error_msg;
+        }
+        return result;
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_with_voice(
+        tts_model_id model_id,
+        const std::string &text,
+        const std::string &reference_audio,
+        const tts_voice_clone_params &params
+    ) {
+        switch (model_id) {
+            case tts_model_id::model_06b_base:
+                return synthesize_06b_base_with_voice(text, reference_audio, params);
+            case tts_model_id::model_1_7b_base:
+                return synthesize_1_7b_base_with_voice(text, reference_audio, params);
+            default:
+                error_msg_ = std::string("synthesize_with_voice is not supported for model: ") +
+                             model_id_name(model_id);
+                return make_error_result(error_msg_);
+        }
+    }
+
+    tts_result Qwen3TTSModelHub::synthesize_with_instruct(
+        tts_model_id model_id,
+        const std::string &text,
+        const std::string &instruct,
+        const tts_custom_voice_params &params
+    ) {
+        switch (model_id) {
+            case tts_model_id::model_1_7b_custom_voice: {
+                tts_custom_voice_instruct_params p;
+                p.common = params.common;
+                p.speaker = params.speaker;
+                p.instruct = instruct;
+                return synthesize_1_7b_custom_voice_with_instruct(text, p);
+            }
+            case tts_model_id::model_1_7b_voice_design: {
+                tts_voice_design_params p;
+                p.common = params.common;
+                p.instruct = instruct;
+                return synthesize_1_7b_voice_design(text, p);
+            }
+            case tts_model_id::model_06b_custom_voice:
+                error_msg_ = "0.6B CustomVoice does not support instruct";
+                return make_error_result(error_msg_);
+            default:
+                error_msg_ = std::string("synthesize_with_instruct is not supported for model: ") +
+                             model_id_name(model_id);
+                return make_error_result(error_msg_);
+        }
+    }
+
+    bool Qwen3TTSModelHub::load_model_internal(
+        tts_model_id model_id,
+        const std::string &model_dir,
+        tts_model_variant expected_variant,
+        int32_t expected_hidden_size
+    ) {
+        std::string tts_model_path;
+        if (!discover_tts_model_path(model_dir, tts_model_path, error_msg_)) {
+            return false;
+        }
+
+        std::string tokenizer_source = shared_tokenizer_path_.empty() ? model_dir : shared_tokenizer_path_;
+        std::string tokenizer_model_path;
+        if (!discover_tokenizer_model_path(tokenizer_source, tokenizer_model_path, error_msg_)) {
+            return false;
+        }
+
+        std::unique_ptr<Qwen3TTS> engine = std::make_unique<Qwen3TTS>();
+        if (!engine->load_models_from_files(tts_model_path, tokenizer_model_path)) {
+            error_msg_ = engine->get_error();
+            return false;
+        }
+
+        tts_model_variant loaded_variant = engine->loaded_model_variant();
+        if (loaded_variant == tts_model_variant::auto_variant) {
+            loaded_variant = infer_model_variant_from_path(tts_model_path + " " + model_dir);
+        }
+        if (expected_variant != tts_model_variant::auto_variant &&
+            loaded_variant != tts_model_variant::auto_variant &&
+            loaded_variant != expected_variant) {
+            error_msg_ = std::string("Loaded model variant mismatch for ") +
+                         model_id_name(model_id) +
+                         ": expected " + variant_name(expected_variant) +
+                         ", got " + variant_name(loaded_variant);
+            return false;
+        }
+
+        int32_t hidden_size = engine->loaded_hidden_size();
+        if (expected_hidden_size > 0 && hidden_size != expected_hidden_size) {
+            error_msg_ = std::string("Loaded hidden_size mismatch for ") +
+                         model_id_name(model_id) +
+                         ": expected " + std::to_string(expected_hidden_size) +
+                         ", got " + std::to_string(hidden_size);
+            return false;
+        }
+
+        auto slot = std::make_unique<model_slot>();
+        slot->model_id = model_id;
+        slot->expected_variant = expected_variant;
+        slot->expected_hidden_size = expected_hidden_size;
+        slot->model_dir = model_dir;
+        slot->tts_model_path = tts_model_path;
+        slot->tokenizer_model_path = tokenizer_model_path;
+        slot->engine = std::move(engine);
+
+        models_[model_id] = std::move(slot);
+        return true;
+    }
+
+    tts_params Qwen3TTSModelHub::build_common_tts_params(const tts_common_params &params) const {
+        tts_params out;
+        out.max_audio_tokens = params.max_audio_tokens;
+        out.temperature = params.temperature;
+        out.top_p = params.top_p;
+        out.top_k = params.top_k;
+        out.n_threads = params.n_threads;
+        out.print_progress = params.print_progress;
+        out.print_timing = params.print_timing;
+        out.repetition_penalty = params.repetition_penalty;
+        out.language_id = params.language_id;
+        return out;
+    }
+
+    Qwen3TTSModelHub::model_slot *Qwen3TTSModelHub::find_slot(tts_model_id model_id) {
+        auto it = models_.find(model_id);
+        if (it == models_.end()) {
+            return nullptr;
+        }
+        return it->second.get();
+    }
+
+    const Qwen3TTSModelHub::model_slot *Qwen3TTSModelHub::find_slot(tts_model_id model_id) const {
+        auto it = models_.find(model_id);
+        if (it == models_.end()) {
+            return nullptr;
+        }
+        return it->second.get();
     }
 
     // WAV file loading (16-bit PCM or 32-bit float)

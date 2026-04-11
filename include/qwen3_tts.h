@@ -7,6 +7,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +30,16 @@ namespace qwen3_tts
         base = 1,
         custom_voice = 2,
         voice_design = 3,
+    };
+
+    // Concrete model families supported by this library
+    enum class tts_model_id
+    {
+        model_06b_base = 0,
+        model_06b_custom_voice = 1,
+        model_1_7b_base = 2,
+        model_1_7b_custom_voice = 3,
+        model_1_7b_voice_design = 4,
     };
 
     // TTS generation parameters
@@ -71,6 +84,50 @@ namespace qwen3_tts
 
         // Base model option: when true, run with x-vector only and do not require reference_text.
         bool x_vector_only_mode = false;
+    };
+
+    // Common generation controls shared by all typed APIs below.
+    struct tts_common_params
+    {
+        int32_t max_audio_tokens = 4096;
+        float temperature = 0.9f;
+        float top_p = 1.0f;
+        int32_t top_k = 50;
+        int32_t n_threads = 4;
+        bool print_progress = false;
+        bool print_timing = true;
+        float repetition_penalty = 1.05f;
+        int32_t language_id = -1;
+    };
+
+    // Voice clone params for Base model families (0.6B/1.7B).
+    struct tts_voice_clone_params
+    {
+        tts_common_params common;
+        std::string reference_text;
+        bool x_vector_only_mode = false;
+    };
+
+    // CustomVoice params without instruct (0.6B and 1.7B no-instruct path).
+    struct tts_custom_voice_params
+    {
+        tts_common_params common;
+        std::string speaker;
+    };
+
+    // 1.7B CustomVoice params with optional instruct.
+    struct tts_custom_voice_instruct_params
+    {
+        tts_common_params common;
+        std::string speaker;
+        std::string instruct;
+    };
+
+    // 1.7B VoiceDesign params (instruct required).
+    struct tts_voice_design_params
+    {
+        tts_common_params common;
+        std::string instruct;
     };
 
     // TTS generation result
@@ -118,6 +175,10 @@ namespace qwen3_tts
         // Load all models from directory
         // model_dir should contain: transformer.gguf, tokenizer.gguf, vocoder.gguf
         bool load_models(const std::string &model_dir);
+
+        // Load model by explicit file paths (for shared tokenizer reuse).
+        bool load_models_from_files(const std::string &tts_model_path,
+                        const std::string &tokenizer_model_path);
 
         // Generate speech from text
         // text: input text to synthesize
@@ -168,6 +229,8 @@ namespace qwen3_tts
 
         tts_model_variant loaded_model_variant() const { return loaded_model_variant_; }
 
+        int32_t loaded_hidden_size() const { return loaded_hidden_size_; }
+
     private:
         tts_result synthesize_internal(const std::string &text,
                                        const float *speaker_embedding,
@@ -185,10 +248,95 @@ namespace qwen3_tts
         bool decoder_loaded_ = false;
         bool low_mem_mode_ = false;
         tts_model_variant loaded_model_variant_ = tts_model_variant::auto_variant;
+        int32_t loaded_hidden_size_ = 0;
         std::string error_msg_;
         std::string tts_model_path_;
         std::string decoder_model_path_;
         tts_progress_callback_t progress_callback_;
+    };
+
+    // Multi-model manager with model-specific load/synthesis APIs.
+    class Qwen3TTSModelHub
+    {
+    public:
+        Qwen3TTSModelHub();
+        ~Qwen3TTSModelHub();
+
+        // Register shared Qwen3-TTS-Tokenizer-12Hz GGUF (file path or directory).
+        // When set, all load_models_* calls reuse this tokenizer path.
+        bool set_shared_tokenizer_12hz(const std::string &tokenizer_model_path_or_dir);
+
+        // Model-specific loaders
+        bool load_models_06b_base(const std::string &model_dir);
+        bool load_models_06b_custom_voice(const std::string &model_dir);
+        bool load_models_1_7b_base(const std::string &model_dir);
+        bool load_models_1_7b_custom_voice(const std::string &model_dir);
+        bool load_models_1_7b_voice_design(const std::string &model_dir);
+
+        // Model state helpers
+        bool unload_model(tts_model_id model_id);
+        bool is_model_loaded(tts_model_id model_id) const;
+        std::vector<tts_model_id> loaded_models() const;
+
+        // 0.6B Base (voice clone)
+        tts_result synthesize_06b_base_with_voice(const std::string &text,
+                                                  const std::string &reference_audio,
+                                                  const tts_voice_clone_params &params = tts_voice_clone_params());
+        tts_result synthesize_06b_base_with_embedding(const std::string &text,
+                                                      const float *embedding, int32_t embedding_size,
+                                                      const tts_common_params &params = tts_common_params());
+
+        // 1.7B Base (voice clone)
+        tts_result synthesize_1_7b_base_with_voice(const std::string &text,
+                                                   const std::string &reference_audio,
+                                                   const tts_voice_clone_params &params = tts_voice_clone_params());
+        tts_result synthesize_1_7b_base_with_embedding(const std::string &text,
+                                                       const float *embedding, int32_t embedding_size,
+                                                       const tts_common_params &params = tts_common_params());
+
+        // 0.6B CustomVoice (no instruct API)
+        tts_result synthesize_06b_custom_voice(const std::string &text,
+                                               const tts_custom_voice_params &params = tts_custom_voice_params());
+
+        // 1.7B CustomVoice
+        tts_result synthesize_1_7b_custom_voice(const std::string &text,
+                                                const tts_custom_voice_params &params = tts_custom_voice_params());
+        tts_result synthesize_1_7b_custom_voice_with_instruct(
+            const std::string &text,
+            const tts_custom_voice_instruct_params &params = tts_custom_voice_instruct_params()
+        );
+
+        // 1.7B VoiceDesign
+        tts_result synthesize_1_7b_voice_design(const std::string &text,
+                                                const tts_voice_design_params &params = tts_voice_design_params());
+
+        // Convenience routers with unified naming.
+        tts_result synthesize_with_voice(tts_model_id model_id,
+                                         const std::string &text,
+                                         const std::string &reference_audio,
+                                         const tts_voice_clone_params &params = tts_voice_clone_params());
+        tts_result synthesize_with_instruct(tts_model_id model_id,
+                                            const std::string &text,
+                                            const std::string &instruct,
+                                            const tts_custom_voice_params &params = tts_custom_voice_params());
+
+        const std::string &get_error() const { return error_msg_; }
+
+    private:
+        struct model_slot;
+
+        bool load_model_internal(tts_model_id model_id,
+                                 const std::string &model_dir,
+                                 tts_model_variant expected_variant,
+                                 int32_t expected_hidden_size);
+
+        tts_params build_common_tts_params(const tts_common_params &params) const;
+        model_slot *find_slot(tts_model_id model_id);
+        const model_slot *find_slot(tts_model_id model_id) const;
+
+        std::map<tts_model_id, std::unique_ptr<model_slot>> models_;
+        std::string shared_tokenizer_path_;
+        std::string error_msg_;
     };
 
     // Utility: Load audio file (WAV format)

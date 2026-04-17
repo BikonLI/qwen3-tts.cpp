@@ -1,5 +1,9 @@
+#include "audio/audio_tokenizer_decoder.h"
+#include "audio/audio_tokenizer_encoder.h"
 #include "gguf_loader.h"
 #include "qwen3_tts.h"
+#include "core/text_tokenizer.h"
+#include "core/tts_transformer.h"
 
 #include <SDL3/SDL.h>
 
@@ -310,7 +314,12 @@ namespace qwen3_tts {
         }
     }
 
-    Qwen3TTS::Qwen3TTS() = default;
+    Qwen3TTS::Qwen3TTS()
+        : tokenizer_(std::make_unique<TextTokenizer>()),
+          transformer_(std::make_unique<TTSTransformer>()),
+          audio_encoder_(std::make_unique<AudioTokenizerEncoder>()),
+          audio_decoder_(std::make_unique<AudioTokenizerDecoder>()) {
+    }
 
     Qwen3TTS::~Qwen3TTS() = default;
 
@@ -329,8 +338,8 @@ namespace qwen3_tts {
         log_memory_usage("load/start");
 
         models_loaded_ = false;
-        transformer_.unload_model();
-        audio_decoder_.unload_model();
+        transformer_->unload_model();
+        audio_decoder_->unload_model();
         transformer_loaded_ = false;
         decoder_loaded_ = false;
         loaded_hidden_size_ = 0;
@@ -379,12 +388,12 @@ namespace qwen3_tts {
                 loaded_model_variant_ = meta_variant;
             }
 
-            if (!tokenizer_.load_from_gguf(loader.get_ctx())) {
-                error_msg_ = "Failed to load text tokenizer: " + tokenizer_.get_error();
+            if (!tokenizer_->load_from_gguf(loader.get_ctx())) {
+                error_msg_ = "Failed to load text tokenizer: " + tokenizer_->get_error();
                 return false;
             }
             fprintf(
-                stderr, "  Text tokenizer loaded: vocab_size=%d (%lld ms)\n", tokenizer_.get_config().vocab_size,
+                stderr, "  Text tokenizer loaded: vocab_size=%d (%lld ms)\n", tokenizer_->get_config().vocab_size,
                 (long long)(get_time_ms() - t_tokenizer_start)
             );
         }
@@ -395,15 +404,15 @@ namespace qwen3_tts {
 
         // Load TTS transformer from TTS model
         int64_t t_transformer_start = get_time_ms();
-        if (!transformer_.load_model(tts_model_path)) {
-            error_msg_ = "Failed to load TTS transformer: " + transformer_.get_error();
+        if (!transformer_->load_model(tts_model_path)) {
+            error_msg_ = "Failed to load TTS transformer: " + transformer_->get_error();
             return false;
         }
         transformer_loaded_ = true;
-        loaded_hidden_size_ = transformer_.get_config().hidden_size;
+        loaded_hidden_size_ = transformer_->get_config().hidden_size;
         fprintf(
             stderr, "  TTS transformer loaded: hidden_size=%d, n_layers=%d (%lld ms)\n",
-            transformer_.get_config().hidden_size, transformer_.get_config().n_layers,
+            transformer_->get_config().hidden_size, transformer_->get_config().n_layers,
             (long long)(get_time_ms() - t_transformer_start)
         );
         fprintf(stderr, "  Inferred model variant: %s\n", variant_name(loaded_model_variant_));
@@ -413,14 +422,14 @@ namespace qwen3_tts {
             // Load vocoder (audio decoder) from tokenizer model
             fprintf(stderr, "Loading vocoder from %s...\n", tokenizer_model_path.c_str());
             int64_t t_decoder_start = get_time_ms();
-            if (!audio_decoder_.load_model(tokenizer_model_path)) {
-                error_msg_ = "Failed to load vocoder: " + audio_decoder_.get_error();
+            if (!audio_decoder_->load_model(tokenizer_model_path)) {
+                error_msg_ = "Failed to load vocoder: " + audio_decoder_->get_error();
                 return false;
             }
             decoder_loaded_ = true;
             fprintf(
                 stderr, "  Vocoder loaded: sample_rate=%d, n_codebooks=%d (%lld ms)\n",
-                audio_decoder_.get_config().sample_rate, audio_decoder_.get_config().n_codebooks,
+                audio_decoder_->get_config().sample_rate, audio_decoder_->get_config().n_codebooks,
                 (long long)(get_time_ms() - t_decoder_start)
             );
             log_memory_usage("load/after-vocoder");
@@ -452,7 +461,7 @@ namespace qwen3_tts {
 
         // For basic synthesis without voice cloning, we use a zero speaker embedding
         // This will use the model's default voice characteristics
-        std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
+        std::vector<float> zero_embedding(transformer_->get_config().hidden_size, 0.0f);
 
         return synthesize_internal(text, zero_embedding.data(), params, result);
     }
@@ -503,8 +512,8 @@ namespace qwen3_tts {
                 return result;
             }
             int64_t t_encoder_load_start = get_time_ms();
-            if (!audio_encoder_.load_model(tts_model_path_)) {
-                result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+            if (!audio_encoder_->load_model(tts_model_path_)) {
+                result.error_msg = "Failed to load speaker encoder: " + audio_encoder_->get_error();
                 return result;
             }
             encoder_loaded_ = true;
@@ -520,8 +529,8 @@ namespace qwen3_tts {
         int64_t t_encode_start = get_time_ms();
         std::vector<float> speaker_embedding;
 
-        if (!audio_encoder_.encode(ref_samples, n_ref_samples, speaker_embedding)) {
-            result.error_msg = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
+        if (!audio_encoder_->encode(ref_samples, n_ref_samples, speaker_embedding)) {
+            result.error_msg = "Failed to extract speaker embedding: " + audio_encoder_->get_error();
             return result;
         }
         result.t_encode_ms = get_time_ms() - t_encode_start;
@@ -547,8 +556,8 @@ namespace qwen3_tts {
                 return false;
             }
             int64_t t_encoder_load_start = get_time_ms();
-            if (!audio_encoder_.load_model(tts_model_path_)) {
-                error_msg_ = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+            if (!audio_encoder_->load_model(tts_model_path_)) {
+                error_msg_ = "Failed to load speaker encoder: " + audio_encoder_->get_error();
                 return false;
             }
             encoder_loaded_ = true;
@@ -560,8 +569,8 @@ namespace qwen3_tts {
             }
         }
 
-        if (!audio_encoder_.encode(ref_samples, n_ref_samples, embedding)) {
-            error_msg_ = "Failed to extract speaker embedding: " + audio_encoder_.get_error();
+        if (!audio_encoder_->encode(ref_samples, n_ref_samples, embedding)) {
+            error_msg_ = "Failed to extract speaker embedding: " + audio_encoder_->get_error();
             return false;
         }
 
@@ -695,13 +704,13 @@ namespace qwen3_tts {
 
         // Step 2: Tokenize input text
         int64_t t_tokenize_start = get_time_ms();
-        std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(
+        std::vector<int32_t> text_tokens = tokenizer_->encode_for_tts(
             text,
             "",
             params.speaker,
             params.reference_text
         );
-        std::vector<int32_t> instruct_tokens = tokenizer_.encode_instruct_for_tts(params.instruct);
+        std::vector<int32_t> instruct_tokens = tokenizer_->encode_instruct_for_tts(params.instruct);
         result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
         sample_memory("synth/after-tokenize");
 
@@ -725,8 +734,8 @@ namespace qwen3_tts {
         int64_t t_generate_start = get_time_ms();
         if (!transformer_loaded_) {
             int64_t t_reload_start = get_time_ms();
-            if (!transformer_.load_model(tts_model_path_)) {
-                result.error_msg = "Failed to reload TTS transformer: " + transformer_.get_error();
+            if (!transformer_->load_model(tts_model_path_)) {
+                result.error_msg = "Failed to reload TTS transformer: " + transformer_->get_error();
                 return result;
             }
             transformer_loaded_ = true;
@@ -735,7 +744,7 @@ namespace qwen3_tts {
                 sample_memory("synth/after-transformer-reload");
             }
         }
-        transformer_.clear_kv_cache();
+        transformer_->clear_kv_cache();
 
         const float * generation_speaker_embedding = speaker_embedding;
         if (speaker_codec_id >= 0) {
@@ -743,7 +752,7 @@ namespace qwen3_tts {
         }
 
         std::vector<int32_t> speech_codes;
-        if (!transformer_.generate(
+        if (!transformer_->generate(
             text_tokens.data(), (int32_t)text_tokens.size(), generation_speaker_embedding,
             params.max_audio_tokens,
             speech_codes, effective_language_id, speaker_codec_id,
@@ -752,13 +761,13 @@ namespace qwen3_tts {
                 instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                 (int32_t)instruct_tokens.size()
             )) {
-            result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
+            result.error_msg = "Failed to generate speech codes: " + transformer_->get_error();
             return result;
         }
         result.t_generate_ms = get_time_ms() - t_generate_start;
         sample_memory("synth/after-generate");
 
-        int n_codebooks = transformer_.get_config().n_codebooks;
+        int n_codebooks = transformer_->get_config().n_codebooks;
         int n_frames = (int)speech_codes.size() / n_codebooks;
 
         if (params.print_progress) {
@@ -771,7 +780,7 @@ namespace qwen3_tts {
         }
 
         if (low_mem_mode_) {
-            transformer_.unload_model();
+            transformer_->unload_model();
             transformer_loaded_ = false;
             sample_memory("synth/after-transformer-unload");
         }
@@ -784,8 +793,8 @@ namespace qwen3_tts {
                 result.error_msg = "Internal error: missing vocoder model path";
                 return result;
             }
-            if (!audio_decoder_.load_model(decoder_model_path_)) {
-                result.error_msg = "Failed to load vocoder: " + audio_decoder_.get_error();
+            if (!audio_decoder_->load_model(decoder_model_path_)) {
+                result.error_msg = "Failed to load vocoder: " + audio_decoder_->get_error();
                 return result;
             }
             decoder_loaded_ = true;
@@ -797,20 +806,20 @@ namespace qwen3_tts {
             }
         }
 
-        if (!audio_decoder_.decode(speech_codes.data(), n_frames, result.audio)) {
-            result.error_msg = "Failed to decode speech codes: " + audio_decoder_.get_error();
+        if (!audio_decoder_->decode(speech_codes.data(), n_frames, result.audio)) {
+            result.error_msg = "Failed to decode speech codes: " + audio_decoder_->get_error();
             return result;
         }
         result.t_decode_ms = get_time_ms() - t_decode_start;
         sample_memory("synth/after-decode");
 
         if (low_mem_mode_) {
-            audio_decoder_.unload_model();
+            audio_decoder_->unload_model();
             decoder_loaded_ = false;
             sample_memory("synth/after-vocoder-unload");
         }
 
-        result.sample_rate = audio_decoder_.get_config().sample_rate;
+        result.sample_rate = audio_decoder_->get_config().sample_rate;
         result.success = true;
         result.t_total_ms = get_time_ms() - t_total_start;
         sample_memory("synth/end");

@@ -1,10 +1,5 @@
 #pragma once
 
-#include "audio_tokenizer_decoder.h"
-#include "audio_tokenizer_encoder.h"
-#include "text_tokenizer.h"
-#include "tts_transformer.h"
-
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -15,6 +10,11 @@
 
 namespace qwen3_tts
 {
+
+    class TextTokenizer;
+    class TTSTransformer;
+    class AudioTokenizerEncoder;
+    class AudioTokenizerDecoder;
 
     enum class tts_task_type
     {
@@ -237,10 +237,10 @@ namespace qwen3_tts
                                        const tts_params &params,
                                        tts_result &result);
 
-        TextTokenizer tokenizer_;
-        TTSTransformer transformer_;
-        AudioTokenizerEncoder audio_encoder_;
-        AudioTokenizerDecoder audio_decoder_;
+        std::unique_ptr<TextTokenizer> tokenizer_;
+        std::unique_ptr<TTSTransformer> transformer_;
+        std::unique_ptr<AudioTokenizerEncoder> audio_encoder_;
+        std::unique_ptr<AudioTokenizerDecoder> audio_decoder_;
 
         bool models_loaded_ = false;
         bool encoder_loaded_ = false;

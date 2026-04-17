@@ -19,17 +19,9 @@ static std::string to_lower_copy(const std::string &s) {
     return out;
 }
 
-static std::string pick_first_sorted(std::vector<std::string> &v) {
-    if (v.empty()) {
-        return {};
-    }
-    std::sort(v.begin(), v.end());
-    return v.front();
-}
-
-static bool resolve_gguf_path(
-    const std::string &path_or_dir,
-    bool expect_tokenizer,
+static bool resolve_gguf_file_path(
+    const std::string &path,
+    const char *arg_name,
     std::string &resolved,
     std::string &error_msg
 ) {
@@ -37,85 +29,22 @@ static bool resolve_gguf_path(
     error_msg.clear();
 
     std::error_code ec;
-    if (fs::exists(path_or_dir, ec) && fs::is_regular_file(path_or_dir, ec)) {
-        if (fs::path(path_or_dir).extension().string() != ".gguf") {
-            error_msg = "Path is not a GGUF file: " + path_or_dir;
-            return false;
-        }
-        resolved = path_or_dir;
-        return true;
-    }
-
-    if (!fs::exists(path_or_dir, ec) || !fs::is_directory(path_or_dir, ec)) {
-        error_msg = "Path does not exist: " + path_or_dir;
+    if (!fs::exists(path, ec)) {
+        error_msg = std::string(arg_name) + " path does not exist: " + path;
         return false;
     }
 
-    std::vector<std::string> tokenizer_candidates;
-    std::vector<std::string> q8_candidates;
-    std::vector<std::string> f16_candidates;
-    std::vector<std::string> fallback_candidates;
-
-    for (const auto &entry : fs::directory_iterator(path_or_dir, ec)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        if (entry.path().extension().string() != ".gguf") {
-            continue;
-        }
-
-        const std::string path = entry.path().string();
-        const std::string name = to_lower_copy(entry.path().filename().string());
-        const bool is_tokenizer = (name.find("tokenizer") != std::string::npos);
-
-        if (expect_tokenizer) {
-            if (is_tokenizer) {
-                tokenizer_candidates.push_back(path);
-            } else {
-                fallback_candidates.push_back(path);
-            }
-            continue;
-        }
-
-        if (is_tokenizer) {
-            continue;
-        }
-
-        if (name.find("q8_0") != std::string::npos) {
-            q8_candidates.push_back(path);
-        } else if (name.find("f16") != std::string::npos) {
-            f16_candidates.push_back(path);
-        } else {
-            fallback_candidates.push_back(path);
-        }
-    }
-
-    if (expect_tokenizer) {
-        if (!tokenizer_candidates.empty()) {
-            resolved = pick_first_sorted(tokenizer_candidates);
-        } else {
-            resolved = pick_first_sorted(fallback_candidates);
-        }
-        if (resolved.empty()) {
-            error_msg = "No tokenizer GGUF found in: " + path_or_dir;
-            return false;
-        }
-        return true;
-    }
-
-    if (!q8_candidates.empty()) {
-        resolved = pick_first_sorted(q8_candidates);
-    } else if (!f16_candidates.empty()) {
-        resolved = pick_first_sorted(f16_candidates);
-    } else {
-        resolved = pick_first_sorted(fallback_candidates);
-    }
-
-    if (resolved.empty()) {
-        error_msg = "No functional model GGUF found in: " + path_or_dir;
+    if (!fs::is_regular_file(path, ec)) {
+        error_msg = std::string(arg_name) + " must be a GGUF file path (directories are not supported): " + path;
         return false;
     }
 
+    if (to_lower_copy(fs::path(path).extension().string()) != ".gguf") {
+        error_msg = std::string(arg_name) + " path is not a GGUF file: " + path;
+        return false;
+    }
+
+    resolved = path;
     return true;
 }
 
@@ -201,11 +130,11 @@ static const char *variant_name(qwen3_tts::tts_model_variant v) {
 }
 
 void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s -m <tts_model_path_or_dir> -mt <tokenizer_path_or_dir> -t <text> [options]\n", program);
+    fprintf(stderr, "Usage: %s -m <tts_model_path.gguf> -mt <tokenizer_path.gguf> -t <text> [options]\n", program);
     fprintf(stderr, "\n");
     fprintf(stderr, "Required:\n");
-    fprintf(stderr, "  -m,  --model <path|dir>           Functional TTS model GGUF (or directory)\n");
-    fprintf(stderr, "  -mt, --model-tokenizer <path|dir> Tokenizer model GGUF (or directory)\n");
+    fprintf(stderr, "  -m,  --model <path>               Functional TTS model GGUF file path\n");
+    fprintf(stderr, "  -mt, --model-tokenizer <path>     Tokenizer model GGUF file path\n");
     fprintf(stderr, "  -t,  --text <text|file>           Input text (or a file path)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Optional:\n");
@@ -231,9 +160,9 @@ void print_usage(const char *program) {
     fprintf(stderr, "  - else: plain synthesize\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s -m models/gguf/0.6b-base -mt models/gguf/tokenizer -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
-    fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice -mt models/gguf/tokenizer -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
-    fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design -mt models/gguf/tokenizer -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/0.6b-base/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
 }
 
 } // namespace
@@ -386,11 +315,11 @@ int main(int argc, char **argv) {
     std::string tokenizer_path;
     std::string resolve_error;
 
-    if (!resolve_gguf_path(model_path_arg, false, model_path, resolve_error)) {
+    if (!resolve_gguf_file_path(model_path_arg, "--model", model_path, resolve_error)) {
         fprintf(stderr, "Error: %s\n", resolve_error.c_str());
         return 1;
     }
-    if (!resolve_gguf_path(tokenizer_path_arg, true, tokenizer_path, resolve_error)) {
+    if (!resolve_gguf_file_path(tokenizer_path_arg, "--model-tokenizer", tokenizer_path, resolve_error)) {
         fprintf(stderr, "Error: %s\n", resolve_error.c_str());
         return 1;
     }

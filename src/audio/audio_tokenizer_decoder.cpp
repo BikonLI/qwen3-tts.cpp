@@ -2,14 +2,26 @@
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#include <cstdlib>
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
 
 namespace qwen3_tts {
+
+static bool decoder_debug_enabled() {
+    const char * env = std::getenv("QWEN3_TTS_DECODER_DEBUG");
+    if (!env || env[0] == '\0') {
+        return false;
+    }
+    std::string v = env;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return !(v == "0" || v == "false" || v == "off" || v == "no");
+}
 
 AudioTokenizerDecoder::AudioTokenizerDecoder() = default;
 
@@ -361,6 +373,12 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     if (state_.backend_cpu) {
         backends.push_back(state_.backend_cpu);
     }
+
+    if (decoder_debug_enabled()) {
+        fprintf(stderr, "[decoder-dbg] scheduler backends=%d cpu_fallback=%d\n",
+                (int)backends.size(), state_.backend_cpu ? 1 : 0);
+    }
+
     state_.sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), QWEN3_TTS_DEC_MAX_NODES, false, true);
     if (!state_.sched) {
         error_msg_ = "Failed to create backend scheduler";
@@ -833,19 +851,25 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     
     const auto & cfg = model_.config;
     
+    const bool dec_dbg = decoder_debug_enabled();
+    auto t0 = std::chrono::steady_clock::now();
+
     codes_buf_.resize(n_frames * cfg.n_codebooks);
     for (int f = 0; f < n_frames; ++f) {
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
             codes_buf_[cb + f * cfg.n_codebooks] = codes[f * cfg.n_codebooks + cb];
         }
     }
+    auto t_pack = std::chrono::steady_clock::now();
     
     struct ggml_cgraph * gf = build_graph(n_frames);
+    auto t_build = std::chrono::steady_clock::now();
     
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
+    auto t_alloc = std::chrono::steady_clock::now();
     
     std::vector<int32_t> cb_codes(n_frames);
     for (int cb = 0; cb < 16; ++cb) {
@@ -876,6 +900,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         ggml_backend_tensor_set(positions_tensor, positions.data(), 0, 
                                 n_frames * sizeof(int32_t));
     }
+    auto t_set = std::chrono::steady_clock::now();
     
 
     
@@ -884,6 +909,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
+    auto t_compute = std::chrono::steady_clock::now();
     
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
@@ -895,8 +921,31 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
+    auto t_get = std::chrono::steady_clock::now();
     
     ggml_backend_sched_reset(state_.sched);
+    auto t_reset = std::chrono::steady_clock::now();
+
+    if (dec_dbg) {
+        auto ms = [](const std::chrono::steady_clock::time_point & a,
+                     const std::chrono::steady_clock::time_point & b) -> long long {
+            return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+        };
+        fprintf(
+            stderr,
+            "[decoder-dbg] decode frames=%d samples=%lld total_ms=%lld pack=%lld build=%lld alloc=%lld set=%lld compute=%lld get=%lld reset=%lld\n",
+            n_frames,
+            (long long)n_samples,
+            ms(t0, t_reset),
+            ms(t0, t_pack),
+            ms(t_pack, t_build),
+            ms(t_build, t_alloc),
+            ms(t_alloc, t_set),
+            ms(t_set, t_compute),
+            ms(t_compute, t_get),
+            ms(t_get, t_reset)
+        );
+    }
     
     return true;
 }
@@ -1001,6 +1050,18 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
     stream_state_.total_frames += n_new_frames;
     stream_state_.emitted_samples += (int64_t)out_samples.size();
 
+    if (decoder_debug_enabled()) {
+        fprintf(
+            stderr,
+            "[decoder-dbg] append new=%d ctx=%d decode_frames=%d out_samples=%zu total_frames=%d\n",
+            n_new_frames,
+            n_ctx,
+            n_decode_frames,
+            out_samples.size(),
+            stream_state_.total_frames
+        );
+    }
+
     return true;
 }
 
@@ -1036,7 +1097,7 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
     }
 
     stream_state_.active = false;
-    stream_state_.left_context_frames = 25;
+    stream_state_.left_context_frames = 4;
     stream_state_.emitted_samples = 0;
     stream_state_.upsample_rate = 1;
     stream_state_.total_frames = 0;

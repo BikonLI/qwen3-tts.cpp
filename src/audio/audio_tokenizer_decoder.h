@@ -175,7 +175,7 @@ public:
                 std::vector<float> & samples);
 
     // Begin incremental decode session for streaming output.
-    bool begin_stream(int32_t left_context_frames = 25);
+    bool begin_stream(int32_t left_context_frames = 4);
 
     // Append new code frames and return newly produced audio samples.
     bool decode_append(const int32_t * codes, int32_t n_new_frames,
@@ -244,7 +244,7 @@ private:
 
     struct stream_state {
         bool active = false;
-        int32_t left_context_frames = 25;
+        int32_t left_context_frames = 4;
         int64_t emitted_samples = 0;
         int32_t upsample_rate = 1;
         int32_t total_frames = 0;

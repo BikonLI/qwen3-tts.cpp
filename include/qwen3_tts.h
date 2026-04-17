@@ -182,8 +182,9 @@ namespace qwen3_tts
         bool stream_full_flush = true;
 
         // Decoder left-context frames for chunked incremental decode.
-        // Official tokenizer chunk decode uses 25 by default.
-        int32_t stream_decoder_left_context_frames = 25;
+        // Official tokenizer chunk decode commonly uses 25, but a smaller
+        // default keeps realtime playback smooth on CPU-fallback paths.
+        int32_t stream_decoder_left_context_frames = 4;
     };
 
     struct tts_audio_chunk

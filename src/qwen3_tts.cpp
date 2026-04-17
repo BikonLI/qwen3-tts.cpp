@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 
 #include <chrono>
+#include <cstdarg>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -33,6 +34,16 @@
 namespace qwen3_tts {
 
     namespace fs = std::filesystem;
+
+    static bool stream_debug_enabled() {
+        const char * env = std::getenv("QWEN3_TTS_STREAM_DEBUG");
+        if (!env || env[0] == '\0') {
+            return false;
+        }
+        std::string v = env;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }
 
     struct tts_stream_session::impl {
         ~impl() {
@@ -1421,16 +1432,49 @@ namespace qwen3_tts {
                 pending_codes.reserve((size_t)chunk_target_frames * (size_t)n_codebooks);
                 int32_t pending_frames = 0;
                 bool any_chunk_emitted = false;
+                const bool stream_dbg = stream_debug_enabled();
+                int64_t stream_t0_ms = get_time_ms();
+                int64_t t_tok_ms = 0;
+                int64_t t_gen_cb_ms = 0;
+                int64_t t_decode_ms = 0;
+                int64_t t_emit_ms = 0;
+                int32_t n_decode_calls = 0;
+                int32_t n_emit_calls = 0;
+                int32_t n_frames_seen = 0;
+
+                auto dbg_log = [&](const char * fmt, ...) {
+                    if (!stream_dbg || !fmt) {
+                        return;
+                    }
+                    va_list args;
+                    va_start(args, fmt);
+                    fprintf(stderr, "[stream-dbg] ");
+                    vfprintf(stderr, fmt, args);
+                    fprintf(stderr, "\n");
+                    va_end(args);
+                };
+
+                dbg_log(
+                    "start chunk_frames=%d left_ctx=%d max_tokens=%d",
+                    chunk_target_frames,
+                    params.stream_decoder_left_context_frames,
+                    p.max_audio_tokens
+                );
 
                 auto emit_pending = [&]() -> bool {
                     if (pending_frames <= 0) {
                         return true;
                     }
                     std::vector<float> chunk_audio;
+                    int64_t t0_ms = get_time_ms();
                     if (!audio_decoder_->decode_append(pending_codes.data(), pending_frames, chunk_audio)) {
                         report_error("Streaming decode failed: " + audio_decoder_->get_error());
                         return false;
                     }
+                    int64_t t1_ms = get_time_ms();
+                    t_decode_ms += (t1_ms - t0_ms);
+                    n_decode_calls++;
+
                     pending_codes.clear();
                     pending_frames = 0;
 
@@ -1439,11 +1483,24 @@ namespace qwen3_tts {
                         chunk.audio = std::move(chunk_audio);
                         chunk.sample_rate = audio_decoder_->get_config().sample_rate;
                         chunk.is_last = false;
+                        int64_t t2_ms = get_time_ms();
                         if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
                             return false;
                         }
+                        int64_t t3_ms = get_time_ms();
+                        t_emit_ms += (t3_ms - t2_ms);
+                        n_emit_calls++;
                         any_chunk_emitted = true;
                     }
+
+                    dbg_log(
+                        "emit decode_call=%d decode_ms=%lld emit_calls=%d pending_out_samples=%d queue=%d",
+                        n_decode_calls,
+                        (long long)(t1_ms - t0_ms),
+                        n_emit_calls,
+                        any_chunk_emitted ? 1 : 0,
+                        (int)impl->queue.size()
+                    );
                     return true;
                 };
 
@@ -1453,6 +1510,7 @@ namespace qwen3_tts {
                 }
 
                 std::vector<int32_t> generated_codes;
+                t_tok_ms = get_time_ms() - stream_t0_ms;
                 const bool gen_ok = transformer_->generate(
                     text_tokens.data(),
                     (int32_t)text_tokens.size(),
@@ -1468,6 +1526,7 @@ namespace qwen3_tts {
                     instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                     (int32_t)instruct_tokens.size(),
                     [&](const int32_t *frame_codes, int32_t cb_count, int32_t frame_index) -> bool {
+                        int64_t cb_t0_ms = get_time_ms();
                         if (cb_count != n_codebooks) {
                             report_error("Unexpected codebook count in streaming callback");
                             return false;
@@ -1484,14 +1543,19 @@ namespace qwen3_tts {
 
                         pending_codes.insert(pending_codes.end(), frame_codes, frame_codes + cb_count);
                         pending_frames++;
+                        n_frames_seen = frame_index + 1;
 
                         if (progress_callback_) {
                             progress_callback_(frame_index + 1, p.max_audio_tokens);
                         }
 
                         if (pending_frames >= chunk_target_frames) {
-                            return emit_pending();
+                            bool ok = emit_pending();
+                            t_gen_cb_ms += (get_time_ms() - cb_t0_ms);
+                            return ok;
                         }
+
+                        t_gen_cb_ms += (get_time_ms() - cb_t0_ms);
 
                         return true;
                     }
@@ -1509,27 +1573,38 @@ namespace qwen3_tts {
                 }
 
                 std::vector<float> tail_samples;
+                int64_t t_tail0_ms = get_time_ms();
                 if (!audio_decoder_->end_stream(tail_samples, params.stream_full_flush)) {
                     report_error("Failed to finalize decoder stream: " + audio_decoder_->get_error());
                     return;
                 }
+                int64_t t_tail1_ms = get_time_ms();
+                t_decode_ms += (t_tail1_ms - t_tail0_ms);
 
                 if (!tail_samples.empty()) {
                     tts_audio_chunk chunk;
                     chunk.audio = std::move(tail_samples);
                     chunk.sample_rate = audio_decoder_->get_config().sample_rate;
                     chunk.is_last = true;
+                    int64_t t_emit0_ms = get_time_ms();
                     if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
                         return;
                     }
+                    int64_t t_emit1_ms = get_time_ms();
+                    t_emit_ms += (t_emit1_ms - t_emit0_ms);
+                    n_emit_calls++;
                     any_chunk_emitted = true;
                 } else {
                     tts_audio_chunk terminal;
                     terminal.sample_rate = audio_decoder_->get_config().sample_rate;
                     terminal.is_last = true;
+                    int64_t t_emit0_ms = get_time_ms();
                     if (!stream_emit_chunk(impl, std::move(terminal), callbacks)) {
                         return;
                     }
+                    int64_t t_emit1_ms = get_time_ms();
+                    t_emit_ms += (t_emit1_ms - t_emit0_ms);
+                    n_emit_calls++;
                 }
 
                 if (callbacks.on_finish) {
@@ -1549,6 +1624,21 @@ namespace qwen3_tts {
                 }
 
                 (void)any_chunk_emitted;
+                if (stream_dbg) {
+                    int64_t t_total_ms = get_time_ms() - stream_t0_ms;
+                    dbg_log(
+                        "done total_ms=%lld tokenize_ms=%lld gen_cb_ms=%lld decode_ms=%lld emit_ms=%lld frames=%d decode_calls=%d emit_calls=%d queue_final=%d",
+                        (long long)t_total_ms,
+                        (long long)t_tok_ms,
+                        (long long)t_gen_cb_ms,
+                        (long long)t_decode_ms,
+                        (long long)t_emit_ms,
+                        n_frames_seen,
+                        n_decode_calls,
+                        n_emit_calls,
+                        (int)impl->queue.size()
+                    );
+                }
                 stream_mark_finished(impl);
             });
         } catch (const std::exception &ex) {

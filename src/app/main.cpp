@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <chrono>
 
 namespace {
 
@@ -377,6 +378,23 @@ static bool run_stream_session(
         return false;
     }
 
+    const char *stream_dbg_env = std::getenv("QWEN3_TTS_STREAM_DEBUG");
+    bool stream_dbg = false;
+    if (stream_dbg_env && stream_dbg_env[0] != '\0') {
+        std::string v = stream_dbg_env;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        stream_dbg = !(v == "0" || v == "false" || v == "off" || v == "no");
+    }
+
+    int64_t poll_ms = 0;
+    int64_t push_ms = 0;
+    int64_t wav_ms = 0;
+    int64_t n_polls = 0;
+    int64_t n_poll_timeouts = 0;
+    int64_t n_chunks = 0;
+    int64_t total_chunk_samples = 0;
+    auto t_stream_start = std::chrono::steady_clock::now();
+
     StreamPlayer player;
     WavStreamWriter writer;
     bool writer_opened = false;
@@ -384,9 +402,14 @@ static bool run_stream_session(
 
     while (true) {
         qwen3_tts::tts_audio_chunk chunk;
+        auto t_poll0 = std::chrono::steady_clock::now();
         qwen3_tts::tts_stream_poll_status status = session->poll(chunk, poll_timeout_ms);
+        auto t_poll1 = std::chrono::steady_clock::now();
+        poll_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_poll1 - t_poll0).count();
+        n_polls++;
 
         if (status == qwen3_tts::tts_stream_poll_status::timeout) {
+            n_poll_timeouts++;
             continue;
         }
 
@@ -403,6 +426,7 @@ static bool run_stream_session(
         }
 
         if (status == qwen3_tts::tts_stream_poll_status::chunk) {
+            n_chunks++;
             if (chunk.sample_rate > 0) {
                 stats.sample_rate = chunk.sample_rate;
             }
@@ -422,18 +446,39 @@ static bool run_stream_session(
                     player_opened = true;
                 }
 
+                auto t_push0 = std::chrono::steady_clock::now();
                 if (!player.push(chunk.audio, error_msg)) {
                     return false;
                 }
+                auto t_push1 = std::chrono::steady_clock::now();
+                push_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_push1 - t_push0).count();
 
+                auto t_wav0 = std::chrono::steady_clock::now();
                 if (writer_opened && !writer.append(chunk.audio, error_msg)) {
                     return false;
                 }
+                auto t_wav1 = std::chrono::steady_clock::now();
+                wav_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_wav1 - t_wav0).count();
 
                 stats.n_samples += chunk.audio.size();
+                total_chunk_samples += (int64_t)chunk.audio.size();
             }
 
             stats.dropped_chunks = std::max(stats.dropped_chunks, chunk.dropped_before);
+
+            if (stream_dbg) {
+                const double chunk_ms = stats.sample_rate > 0
+                    ? ((double)chunk.audio.size() * 1000.0 / (double)stats.sample_rate)
+                    : 0.0;
+                fprintf(
+                    stderr,
+                    "[stream-cli] chunk=%lld samples=%zu dur_ms=%.1f dropped_before=%d\n",
+                    (long long)chunk.chunk_id,
+                    chunk.audio.size(),
+                    chunk_ms,
+                    chunk.dropped_before
+                );
+            }
             continue;
         }
     }
@@ -448,6 +493,29 @@ static bool run_stream_session(
     }
 
     stats.dropped_chunks = std::max(stats.dropped_chunks, session->dropped_chunks());
+
+    if (stream_dbg) {
+        auto t_stream_end = std::chrono::steady_clock::now();
+        int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_stream_end - t_stream_start).count();
+        double avg_chunk_ms = 0.0;
+        if (n_chunks > 0 && stats.sample_rate > 0) {
+            avg_chunk_ms = ((double)total_chunk_samples * 1000.0 / (double)stats.sample_rate) / (double)n_chunks;
+        }
+        fprintf(
+            stderr,
+            "[stream-cli] done total_ms=%lld polls=%lld poll_ms=%lld timeouts=%lld chunks=%lld avg_chunk_audio_ms=%.1f push_ms=%lld wav_ms=%lld dropped=%d\n",
+            (long long)total_ms,
+            (long long)n_polls,
+            (long long)poll_ms,
+            (long long)n_poll_timeouts,
+            (long long)n_chunks,
+            avg_chunk_ms,
+            (long long)push_ms,
+            (long long)wav_ms,
+            stats.dropped_chunks
+        );
+    }
+
     return true;
 }
 
@@ -475,7 +543,7 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --stream                          Enable streaming generation/playback\n");
     fprintf(stderr, "  --stream-save <wav>               Save streamed audio while playing\n");
     fprintf(stderr, "  --stream-chunk-frames <n>         Frames per streamed chunk (default: 4)\n");
-    fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 25)\n");
+    fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 4)\n");
     fprintf(stderr, "  --stream-queue-cap <n>            Stream queue capacity (default: 8)\n");
     fprintf(stderr, "  --stream-poll-timeout <ms>        Poll timeout for stream client (default: 100)\n");
     fprintf(stderr, "  -j, --threads <n>                 Number of threads\n");
@@ -511,7 +579,7 @@ int main(int argc, char **argv) {
     int32_t stream_chunk_frames = 4;
     int32_t stream_queue_cap = 8;
     int32_t stream_poll_timeout = 100;
-    int32_t stream_decoder_left_context = 25;
+    int32_t stream_decoder_left_context = 4;
 
     qwen3_tts::tts_params params;
 

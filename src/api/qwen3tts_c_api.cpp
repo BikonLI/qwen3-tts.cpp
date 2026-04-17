@@ -4,6 +4,8 @@
  * Synthesis calls use @autoreleasepool on macOS to drain Metal
  * Objective-C objects when called from background threads. */
 
+#include "qwen3tts_c_api.h"
+
 #include "qwen3_tts.h"
 
 #ifdef __APPLE__
@@ -28,29 +30,6 @@ static void drain_autorelease_pool(void * pool) {
 
 #include <cstring>
 #include <cstdlib>
-
-// Match the C API header types (qwen3tts_c_api.h)
-struct Qwen3TtsParams {
-    int32_t max_audio_tokens;
-    float   temperature;
-    float   top_p;
-    int32_t top_k;
-    int32_t n_threads;
-    float   repetition_penalty;
-    int32_t language_id;
-    int32_t task_type;
-    int32_t model_variant;
-    const char * instruct;
-    const char * speaker;
-    const char * reference_text;
-    int32_t x_vector_only_mode;
-};
-
-struct Qwen3TtsAudio {
-    const float * samples;
-    int32_t n_samples;
-    int32_t sample_rate;
-};
 
 // Opaque handle - backs the C typedef
 struct Qwen3Tts {

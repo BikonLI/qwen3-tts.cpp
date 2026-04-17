@@ -84,6 +84,10 @@ namespace qwen3_tts
 
         // Base model option: when true, run with x-vector only and do not require reference_text.
         bool x_vector_only_mode = false;
+
+        // Limit talker decode attention to the most recent N tokens.
+        // 0 disables the limit (full attention over all past tokens).
+        int32_t talker_attention_window = 0;
     };
 
     // Common generation controls shared by all typed APIs below.
@@ -98,6 +102,9 @@ namespace qwen3_tts
         bool print_timing = true;
         float repetition_penalty = 1.05f;
         int32_t language_id = -1;
+
+        // See tts_params::talker_attention_window.
+        int32_t talker_attention_window = 0;
     };
 
     // Voice clone params for Base model families (0.6B/1.7B).
@@ -169,6 +176,10 @@ namespace qwen3_tts
     {
         tts_params tts;
 
+        // Apply talker attention window during stream generation.
+        // 0 means use tts.talker_attention_window as-is.
+        int32_t stream_talker_attention_window = 512;
+
         // Number of code frames to aggregate before emitting one audio chunk.
         int32_t stream_chunk_frames = 4;
 
@@ -178,13 +189,29 @@ namespace qwen3_tts
         // Default poll timeout in milliseconds when caller passes timeout < 0.
         int32_t stream_poll_timeout_ms = 100;
 
-        // Run end-of-stream full flush before finish.
-        bool stream_full_flush = true;
+        // Run end-of-stream flush decode before finish.
+        // Disabled by default because delay-compensated incremental decode
+        // usually avoids the expensive full utterance re-decode.
+        bool stream_full_flush = false;
 
         // Decoder left-context frames for chunked incremental decode.
         // Official tokenizer chunk decode commonly uses 25, but a smaller
         // default keeps realtime playback smooth on CPU-fallback paths.
         int32_t stream_decoder_left_context_frames = 4;
+
+        // Adaptive stream control: tune chunk/context by decode realtime ratio.
+        bool stream_adaptive_tuning = true;
+        int32_t stream_chunk_frames_min = 2;
+        int32_t stream_chunk_frames_max = 16;
+        int32_t stream_left_context_frames_min = 2;
+        float stream_adaptive_high_ratio = 1.15f;
+        float stream_adaptive_low_ratio = 0.65f;
+
+        // Run decode+emit in a dedicated worker to overlap generation and vocoder.
+        bool stream_parallel_decode = true;
+
+        // Queue overflow policy: true drops oldest chunk, false blocks producer.
+        bool stream_drop_oldest_on_overflow = false;
     };
 
     struct tts_audio_chunk

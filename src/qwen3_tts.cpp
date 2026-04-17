@@ -60,6 +60,7 @@ namespace qwen3_tts {
         std::condition_variable cv;
         std::deque<tts_audio_chunk> queue;
         int32_t queue_capacity = 8;
+        bool drop_oldest_on_overflow = false;
         int32_t default_poll_timeout_ms = 100;
         int32_t dropped_chunks = 0;
         bool finished = false;
@@ -94,6 +95,7 @@ namespace qwen3_tts {
         if (!impl_->queue.empty()) {
             chunk = std::move(impl_->queue.front());
             impl_->queue.pop_front();
+            impl_->cv.notify_all();
             return tts_stream_poll_status::chunk;
         }
 
@@ -175,11 +177,20 @@ namespace qwen3_tts {
         }
 
         {
-            std::lock_guard<std::mutex> lock(impl->mutex);
+            std::unique_lock<std::mutex> lock(impl->mutex);
             const int32_t capacity = std::max(1, impl->queue_capacity);
             while ((int32_t)impl->queue.size() >= capacity) {
-                impl->queue.pop_front();
-                impl->dropped_chunks++;
+                if (impl->drop_oldest_on_overflow) {
+                    impl->queue.pop_front();
+                    impl->dropped_chunks++;
+                    continue;
+                }
+                impl->cv.wait(lock, [&]() {
+                    return (int32_t)impl->queue.size() < capacity || impl->finished || impl->has_error;
+                });
+                if (impl->finished || impl->has_error) {
+                    return false;
+                }
             }
             chunk.chunk_id = impl->next_chunk_id++;
             chunk.dropped_before = impl->dropped_chunks;
@@ -959,6 +970,7 @@ namespace qwen3_tts {
             result.error_msg = "Failed to set transformer thread count: " + transformer_->get_error();
             return result;
         }
+        transformer_->set_talker_attention_window(params.talker_attention_window);
         transformer_->clear_kv_cache();
 
         const float * generation_speaker_embedding = speaker_embedding;
@@ -1268,6 +1280,7 @@ namespace qwen3_tts {
 
         auto impl = std::make_shared<tts_stream_session::impl>();
         impl->queue_capacity = std::max(1, params.stream_queue_capacity);
+        impl->drop_oldest_on_overflow = params.stream_drop_oldest_on_overflow;
         impl->default_poll_timeout_ms = std::max(0, params.stream_poll_timeout_ms);
 
         std::shared_ptr<tts_stream_session> session(new tts_stream_session(impl));
@@ -1404,6 +1417,11 @@ namespace qwen3_tts {
                     report_error("Failed to set transformer thread count: " + transformer_->get_error());
                     return;
                 }
+                const int32_t stream_talker_window =
+                    params.stream_talker_attention_window > 0
+                        ? params.stream_talker_attention_window
+                        : p.talker_attention_window;
+                transformer_->set_talker_attention_window(stream_talker_window);
 
                 if (!decoder_loaded_) {
                     if (decoder_model_path_.empty()) {
@@ -1427,12 +1445,22 @@ namespace qwen3_tts {
                 }
 
                 const int32_t n_codebooks = transformer_->get_config().n_codebooks;
-                const int32_t chunk_target_frames = std::max(1, params.stream_chunk_frames);
+                int32_t chunk_target_frames = std::max(1, params.stream_chunk_frames);
+                int32_t left_context_frames = std::max(0, params.stream_decoder_left_context_frames);
+                const int32_t chunk_target_base = chunk_target_frames;
+                const int32_t left_context_base = left_context_frames;
+                std::atomic<int32_t> chunk_target_shared{chunk_target_frames};
                 std::vector<int32_t> pending_codes;
                 pending_codes.reserve((size_t)chunk_target_frames * (size_t)n_codebooks);
                 int32_t pending_frames = 0;
                 bool any_chunk_emitted = false;
                 const bool stream_dbg = stream_debug_enabled();
+                const bool adaptive_enabled = params.stream_adaptive_tuning;
+                const int32_t adaptive_chunk_min = std::max(1, params.stream_chunk_frames_min);
+                const int32_t adaptive_chunk_max = std::max(adaptive_chunk_min, params.stream_chunk_frames_max);
+                const int32_t adaptive_ctx_min = std::max(0, params.stream_left_context_frames_min);
+                const float adaptive_high = std::max(0.10f, params.stream_adaptive_high_ratio);
+                const float adaptive_low = std::max(0.05f, std::min(params.stream_adaptive_low_ratio, adaptive_high));
                 int64_t stream_t0_ms = get_time_ms();
                 int64_t t_tok_ms = 0;
                 int64_t t_gen_cb_ms = 0;
@@ -1441,6 +1469,24 @@ namespace qwen3_tts {
                 int32_t n_decode_calls = 0;
                 int32_t n_emit_calls = 0;
                 int32_t n_frames_seen = 0;
+
+                struct decode_work_item {
+                    std::vector<int32_t> codes;
+                    int32_t n_frames = 0;
+                    bool allow_adaptive_tuning = false;
+                };
+                std::mutex decode_mutex;
+                std::condition_variable decode_cv;
+                std::deque<decode_work_item> decode_queue;
+                const size_t decode_work_capacity = (size_t)std::max(
+                    1,
+                    params.stream_parallel_decode
+                        ? std::max(2, params.stream_queue_capacity / 2)
+                        : 1
+                );
+                bool decode_input_done = false;
+                std::atomic<bool> decode_failed{false};
+                std::string decode_error;
 
                 auto dbg_log = [&](const char * fmt, ...) {
                     if (!stream_dbg || !fmt) {
@@ -1457,50 +1503,306 @@ namespace qwen3_tts {
                 dbg_log(
                     "start chunk_frames=%d left_ctx=%d max_tokens=%d",
                     chunk_target_frames,
-                    params.stream_decoder_left_context_frames,
+                    left_context_frames,
                     p.max_audio_tokens
                 );
 
-                auto emit_pending = [&]() -> bool {
+                auto set_decode_error = [&](const std::string &msg) {
+                    std::lock_guard<std::mutex> lock(decode_mutex);
+                    if (!decode_failed.load()) {
+                        decode_error = msg;
+                    }
+                    decode_failed.store(true);
+                    decode_cv.notify_all();
+                };
+
+                auto get_decode_error = [&]() -> std::string {
+                    std::lock_guard<std::mutex> lock(decode_mutex);
+                    return decode_error;
+                };
+
+                std::thread decode_worker([&]() {
+                    double adaptive_ratio_ema = -1.0;
+                    int32_t adaptive_slow_streak = 0;
+                    int32_t adaptive_fast_streak = 0;
+                    int32_t adaptive_cooldown = 0;
+                    int32_t local_left_context_frames = left_context_frames;
+
+                    while (true) {
+                        decode_work_item work;
+                        {
+                            std::unique_lock<std::mutex> lock(decode_mutex);
+                            decode_cv.wait(lock, [&]() {
+                                return !decode_queue.empty() || decode_input_done || decode_failed.load();
+                            });
+                            if (decode_failed.load()) {
+                                return;
+                            }
+                            if (decode_queue.empty()) {
+                                if (decode_input_done) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            work = std::move(decode_queue.front());
+                            decode_queue.pop_front();
+                        }
+                        decode_cv.notify_all();
+
+                        if (work.n_frames <= 0 || work.codes.empty()) {
+                            continue;
+                        }
+
+                        std::vector<float> chunk_audio;
+                        const int64_t t0_ms = get_time_ms();
+                        if (!audio_decoder_->decode_append(work.codes.data(), work.n_frames, chunk_audio)) {
+                            set_decode_error("Streaming decode failed: " + audio_decoder_->get_error());
+                            return;
+                        }
+                        const int64_t t1_ms = get_time_ms();
+                        t_decode_ms += (t1_ms - t0_ms);
+                        n_decode_calls++;
+
+                        const int32_t sr = audio_decoder_->get_config().sample_rate;
+                        if (adaptive_enabled && work.allow_adaptive_tuning && sr > 0 && work.n_frames > 0) {
+                            const double audio_ms = (double)work.n_frames * 1920.0 * 1000.0 / (double)sr;
+                            if (audio_ms >= 120.0) {
+                                const double ratio_raw = audio_ms > 0.0 ? (double)(t1_ms - t0_ms) / audio_ms : 0.0;
+                                adaptive_ratio_ema = (adaptive_ratio_ema < 0.0)
+                                    ? ratio_raw
+                                    : (adaptive_ratio_ema * 0.70 + ratio_raw * 0.30);
+
+                                if (adaptive_cooldown > 0) {
+                                    adaptive_cooldown--;
+                                }
+
+                                if (adaptive_ratio_ema > adaptive_high) {
+                                    adaptive_slow_streak++;
+                                    adaptive_fast_streak = 0;
+                                } else if (adaptive_ratio_ema < adaptive_low) {
+                                    adaptive_fast_streak++;
+                                    adaptive_slow_streak = 0;
+                                } else {
+                                    adaptive_slow_streak = 0;
+                                    adaptive_fast_streak = 0;
+                                }
+
+                                bool tuned = false;
+                                if (adaptive_cooldown == 0 && adaptive_slow_streak >= 1) {
+                                    const int32_t chunk_step = adaptive_ratio_ema > (double)adaptive_high * 1.35 ? 2 : 1;
+                                    int32_t chunk_cur = chunk_target_shared.load();
+                                    if (chunk_cur < adaptive_chunk_max) {
+                                        chunk_cur = std::min(adaptive_chunk_max, chunk_cur + chunk_step);
+                                        chunk_target_shared.store(chunk_cur);
+                                        tuned = true;
+                                    }
+                                    if (local_left_context_frames > adaptive_ctx_min) {
+                                        local_left_context_frames = std::max(adaptive_ctx_min, local_left_context_frames - 1);
+                                        if (!audio_decoder_->set_stream_left_context(local_left_context_frames)) {
+                                            set_decode_error("Failed to tune stream left context: " + audio_decoder_->get_error());
+                                            return;
+                                        }
+                                        tuned = true;
+                                    }
+                                    adaptive_slow_streak = 0;
+                                    if (tuned) {
+                                        adaptive_cooldown = 2;
+                                    }
+                                } else if (adaptive_cooldown == 0 && adaptive_fast_streak >= 2) {
+                                    int32_t chunk_cur = chunk_target_shared.load();
+                                    if (local_left_context_frames < left_context_base) {
+                                        local_left_context_frames = std::min(left_context_base, local_left_context_frames + 1);
+                                        if (!audio_decoder_->set_stream_left_context(local_left_context_frames)) {
+                                            set_decode_error("Failed to tune stream left context: " + audio_decoder_->get_error());
+                                            return;
+                                        }
+                                        tuned = true;
+                                    }
+                                    if (chunk_cur > chunk_target_base) {
+                                        chunk_cur = std::max(chunk_target_base, chunk_cur - 1);
+                                        chunk_target_shared.store(chunk_cur);
+                                        tuned = true;
+                                    }
+                                    adaptive_fast_streak = 0;
+                                    if (tuned) {
+                                        adaptive_cooldown = 3;
+                                    }
+                                }
+
+                                if (tuned) {
+                                    dbg_log(
+                                        "adaptive ratio_raw=%.3f ratio_ema=%.3f chunk=%d ctx=%d decode_ms=%lld audio_ms=%.1f",
+                                        ratio_raw,
+                                        adaptive_ratio_ema,
+                                        chunk_target_shared.load(),
+                                        local_left_context_frames,
+                                        (long long)(t1_ms - t0_ms),
+                                        audio_ms
+                                    );
+                                }
+                            }
+                        }
+
+                        const int32_t out_samples_count = (int32_t)chunk_audio.size();
+                        if (!chunk_audio.empty()) {
+                            tts_audio_chunk chunk;
+                            chunk.audio = std::move(chunk_audio);
+                            chunk.sample_rate = audio_decoder_->get_config().sample_rate;
+                            chunk.is_last = false;
+
+                            const int64_t t_emit0_ms = get_time_ms();
+                            if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
+                                std::string emit_error;
+                                {
+                                    std::lock_guard<std::mutex> lock(impl->mutex);
+                                    emit_error = impl->error_msg;
+                                }
+                                if (emit_error.empty()) {
+                                    emit_error = "Failed to emit stream audio chunk";
+                                }
+                                set_decode_error(emit_error);
+                                return;
+                            }
+                            const int64_t t_emit1_ms = get_time_ms();
+                            t_emit_ms += (t_emit1_ms - t_emit0_ms);
+                            n_emit_calls++;
+                            any_chunk_emitted = true;
+                        }
+
+                        int32_t queue_size = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(impl->mutex);
+                            queue_size = (int32_t)impl->queue.size();
+                        }
+
+                        dbg_log(
+                            "emit decode_call=%d decode_ms=%lld emit_calls=%d out_samples=%d queue=%d",
+                            n_decode_calls,
+                            (long long)(t1_ms - t0_ms),
+                            n_emit_calls,
+                            out_samples_count,
+                            queue_size
+                        );
+                    }
+
+                    std::vector<float> tail_samples;
+                    const int64_t t_tail0_ms = get_time_ms();
+                    if (!audio_decoder_->end_stream(tail_samples, params.stream_full_flush)) {
+                        set_decode_error("Failed to finalize decoder stream: " + audio_decoder_->get_error());
+                        return;
+                    }
+                    const int64_t t_tail1_ms = get_time_ms();
+                    t_decode_ms += (t_tail1_ms - t_tail0_ms);
+
+                    if (!tail_samples.empty()) {
+                        tts_audio_chunk chunk;
+                        chunk.audio = std::move(tail_samples);
+                        chunk.sample_rate = audio_decoder_->get_config().sample_rate;
+                        chunk.is_last = true;
+                        const int64_t t_emit0_ms = get_time_ms();
+                        if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
+                            std::string emit_error;
+                            {
+                                std::lock_guard<std::mutex> lock(impl->mutex);
+                                emit_error = impl->error_msg;
+                            }
+                            if (emit_error.empty()) {
+                                emit_error = "Failed to emit final stream audio chunk";
+                            }
+                            set_decode_error(emit_error);
+                            return;
+                        }
+                        const int64_t t_emit1_ms = get_time_ms();
+                        t_emit_ms += (t_emit1_ms - t_emit0_ms);
+                        n_emit_calls++;
+                        any_chunk_emitted = true;
+                    } else if (!any_chunk_emitted) {
+                        tts_audio_chunk terminal;
+                        terminal.sample_rate = audio_decoder_->get_config().sample_rate;
+                        terminal.is_last = true;
+                        const int64_t t_emit0_ms = get_time_ms();
+                        if (!stream_emit_chunk(impl, std::move(terminal), callbacks)) {
+                            std::string emit_error;
+                            {
+                                std::lock_guard<std::mutex> lock(impl->mutex);
+                                emit_error = impl->error_msg;
+                            }
+                            if (emit_error.empty()) {
+                                emit_error = "Failed to emit stream terminal chunk";
+                            }
+                            set_decode_error(emit_error);
+                            return;
+                        }
+                        const int64_t t_emit1_ms = get_time_ms();
+                        t_emit_ms += (t_emit1_ms - t_emit0_ms);
+                        n_emit_calls++;
+                    }
+                });
+
+                struct decode_worker_guard {
+                    std::mutex &mutex;
+                    std::condition_variable &cv;
+                    bool &input_done;
+                    std::thread &worker;
+                    ~decode_worker_guard() {
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            input_done = true;
+                        }
+                        cv.notify_all();
+                        if (worker.joinable()) {
+                            worker.join();
+                        }
+                    }
+                } decode_guard{decode_mutex, decode_cv, decode_input_done, decode_worker};
+
+                auto enqueue_decode = [&](std::vector<int32_t> &&codes, int32_t n_frames, bool allow_adaptive_tuning) -> bool {
+                    if (n_frames <= 0 || codes.empty()) {
+                        return true;
+                    }
+
+                    std::unique_lock<std::mutex> lock(decode_mutex);
+                    decode_cv.wait(lock, [&]() {
+                        return decode_queue.size() < decode_work_capacity || decode_failed.load();
+                    });
+                    if (decode_failed.load()) {
+                        return false;
+                    }
+
+                    decode_work_item item;
+                    item.codes = std::move(codes);
+                    item.n_frames = n_frames;
+                    item.allow_adaptive_tuning = allow_adaptive_tuning;
+                    decode_queue.push_back(std::move(item));
+                    lock.unlock();
+                    decode_cv.notify_all();
+                    return true;
+                };
+
+                auto fail_from_decode_worker = [&]() -> bool {
+                    std::string msg = get_decode_error();
+                    if (msg.empty()) {
+                        msg = "Streaming decode worker failed";
+                    }
+                    report_error(msg);
+                    return false;
+                };
+
+                auto emit_pending = [&](bool allow_adaptive_tuning) -> bool {
                     if (pending_frames <= 0) {
                         return true;
                     }
-                    std::vector<float> chunk_audio;
-                    int64_t t0_ms = get_time_ms();
-                    if (!audio_decoder_->decode_append(pending_codes.data(), pending_frames, chunk_audio)) {
-                        report_error("Streaming decode failed: " + audio_decoder_->get_error());
-                        return false;
-                    }
-                    int64_t t1_ms = get_time_ms();
-                    t_decode_ms += (t1_ms - t0_ms);
-                    n_decode_calls++;
 
+                    std::vector<int32_t> chunk_codes = std::move(pending_codes);
+                    const int32_t chunk_frames = pending_frames;
                     pending_codes.clear();
                     pending_frames = 0;
+                    const int32_t reserve_frames = std::max(1, chunk_target_shared.load());
+                    pending_codes.reserve((size_t)reserve_frames * (size_t)n_codebooks);
 
-                    if (!chunk_audio.empty()) {
-                        tts_audio_chunk chunk;
-                        chunk.audio = std::move(chunk_audio);
-                        chunk.sample_rate = audio_decoder_->get_config().sample_rate;
-                        chunk.is_last = false;
-                        int64_t t2_ms = get_time_ms();
-                        if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
-                            return false;
-                        }
-                        int64_t t3_ms = get_time_ms();
-                        t_emit_ms += (t3_ms - t2_ms);
-                        n_emit_calls++;
-                        any_chunk_emitted = true;
+                    if (!enqueue_decode(std::move(chunk_codes), chunk_frames, allow_adaptive_tuning)) {
+                        return fail_from_decode_worker();
                     }
-
-                    dbg_log(
-                        "emit decode_call=%d decode_ms=%lld emit_calls=%d pending_out_samples=%d queue=%d",
-                        n_decode_calls,
-                        (long long)(t1_ms - t0_ms),
-                        n_emit_calls,
-                        any_chunk_emitted ? 1 : 0,
-                        (int)impl->queue.size()
-                    );
                     return true;
                 };
 
@@ -1526,6 +1828,10 @@ namespace qwen3_tts {
                     instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                     (int32_t)instruct_tokens.size(),
                     [&](const int32_t *frame_codes, int32_t cb_count, int32_t frame_index) -> bool {
+                        if (decode_failed.load()) {
+                            return fail_from_decode_worker();
+                        }
+
                         int64_t cb_t0_ms = get_time_ms();
                         if (cb_count != n_codebooks) {
                             report_error("Unexpected codebook count in streaming callback");
@@ -1549,8 +1855,9 @@ namespace qwen3_tts {
                             progress_callback_(frame_index + 1, p.max_audio_tokens);
                         }
 
-                        if (pending_frames >= chunk_target_frames) {
-                            bool ok = emit_pending();
+                        const int32_t chunk_target_now = std::max(1, chunk_target_shared.load());
+                        if (pending_frames >= chunk_target_now) {
+                            bool ok = emit_pending(true);
                             t_gen_cb_ms += (get_time_ms() - cb_t0_ms);
                             return ok;
                         }
@@ -1568,43 +1875,22 @@ namespace qwen3_tts {
                     return;
                 }
 
-                if (!emit_pending()) {
+                if (!emit_pending(false)) {
                     return;
                 }
 
-                std::vector<float> tail_samples;
-                int64_t t_tail0_ms = get_time_ms();
-                if (!audio_decoder_->end_stream(tail_samples, params.stream_full_flush)) {
-                    report_error("Failed to finalize decoder stream: " + audio_decoder_->get_error());
-                    return;
+                {
+                    std::lock_guard<std::mutex> lock(decode_mutex);
+                    decode_input_done = true;
                 }
-                int64_t t_tail1_ms = get_time_ms();
-                t_decode_ms += (t_tail1_ms - t_tail0_ms);
+                decode_cv.notify_all();
+                if (decode_worker.joinable()) {
+                    decode_worker.join();
+                }
 
-                if (!tail_samples.empty()) {
-                    tts_audio_chunk chunk;
-                    chunk.audio = std::move(tail_samples);
-                    chunk.sample_rate = audio_decoder_->get_config().sample_rate;
-                    chunk.is_last = true;
-                    int64_t t_emit0_ms = get_time_ms();
-                    if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
-                        return;
-                    }
-                    int64_t t_emit1_ms = get_time_ms();
-                    t_emit_ms += (t_emit1_ms - t_emit0_ms);
-                    n_emit_calls++;
-                    any_chunk_emitted = true;
-                } else {
-                    tts_audio_chunk terminal;
-                    terminal.sample_rate = audio_decoder_->get_config().sample_rate;
-                    terminal.is_last = true;
-                    int64_t t_emit0_ms = get_time_ms();
-                    if (!stream_emit_chunk(impl, std::move(terminal), callbacks)) {
-                        return;
-                    }
-                    int64_t t_emit1_ms = get_time_ms();
-                    t_emit_ms += (t_emit1_ms - t_emit0_ms);
-                    n_emit_calls++;
+                if (decode_failed.load()) {
+                    fail_from_decode_worker();
+                    return;
                 }
 
                 if (callbacks.on_finish) {
@@ -2142,6 +2428,7 @@ namespace qwen3_tts {
         out.print_timing = params.print_timing;
         out.repetition_penalty = params.repetition_penalty;
         out.language_id = params.language_id;
+        out.talker_attention_window = params.talker_attention_window;
         return out;
     }
 

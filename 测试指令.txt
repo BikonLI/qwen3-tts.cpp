@@ -49,3 +49,9 @@ New-Item -ItemType Directory -Force .\outputs | Out-Null
 8) 1.7B VoiceDesign - 中文 + 语言指定
 --------------------------------------------------
 .\build\Release\qwen3-tts-cli.exe -m .\models\gguf\1.7b-voice-design\qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t "这是一个中文语音设计测试。" --instruct "女声，温柔，语速稍慢，情绪稳定。" -l zh -o .\outputs\test_17b_voice_design_zh.wav
+
+
+.\build\Release\qwen3-tts-cli.exe  -m .\models\gguf\0.6b-custom-voice\qwen3-tts-12hz-0.6b-custom-voice-f16.gguf  -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --stream --stream-realtime --speaker eric
+
+# 若要做纯性能基准（不播放），可使用：
+# .\build\Release\qwen3-tts-cli.exe -m .\models\gguf\0.6b-custom-voice\qwen3-tts-12hz-0.6b-custom-voice-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --stream --stream-realtime --stream-no-playback --speaker eric

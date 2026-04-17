@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cstdlib>
+#include <limits>
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
 
@@ -30,6 +31,8 @@ AudioTokenizerDecoder::~AudioTokenizerDecoder() {
 }
 
 void AudioTokenizerDecoder::unload_model() {
+    reset_decode_graph_cache();
+
     free_audio_decoder_model(model_);
     
     if (state_.sched) {
@@ -44,9 +47,6 @@ void AudioTokenizerDecoder::unload_model() {
         ggml_backend_free(state_.backend_cpu);
         state_.backend_cpu = nullptr;
     }
-
-    state_.compute_meta.clear();
-    codes_buf_.clear();
 }
 
 void AudioTokenizerDecoder::normalize_codebooks() {
@@ -385,8 +385,6 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         return false;
     }
     
-    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
-    
     return true;
 }
 
@@ -407,6 +405,147 @@ bool AudioTokenizerDecoder::set_n_threads(int32_t n_threads) {
 
     if (state_.backend_cpu && !set_backend_n_threads(state_.backend_cpu, n_threads)) {
         error_msg_ = "CPU fallback backend does not support thread configuration";
+        return false;
+    }
+
+    return true;
+}
+
+void AudioTokenizerDecoder::reset_decode_graph_cache() {
+    if (state_.sched) {
+        ggml_backend_sched_reset(state_.sched);
+    }
+
+    for (auto & entry : decode_graph_cache_) {
+        free_decode_graph_entry(entry);
+    }
+    decode_graph_cache_.clear();
+    active_decode_graph_frames_ = -1;
+    decode_graph_use_tick_ = 0;
+}
+
+void AudioTokenizerDecoder::free_decode_graph_entry(decode_graph_cache_entry & entry) {
+    if (entry.ctx) {
+        ggml_free(entry.ctx);
+    }
+    entry = decode_graph_cache_entry();
+}
+
+void AudioTokenizerDecoder::apply_graph_backend_hints(decode_graph_cache_entry & entry) {
+    (void)entry;
+}
+
+bool AudioTokenizerDecoder::ensure_decode_graph(int32_t n_frames, decode_graph_cache_entry *& entry_out) {
+    entry_out = nullptr;
+
+    if (n_frames <= 0) {
+        error_msg_ = "Invalid frame count";
+        return false;
+    }
+
+    if (!state_.sched) {
+        error_msg_ = "Backend scheduler is not initialized";
+        return false;
+    }
+
+    for (auto & entry : decode_graph_cache_) {
+        if (entry.n_frames == n_frames && entry.gf && entry.ctx) {
+            entry.use_tick = ++decode_graph_use_tick_;
+            entry_out = &entry;
+            return true;
+        }
+    }
+
+    decode_graph_cache_entry fresh;
+    fresh.n_frames = n_frames;
+    fresh.use_tick = ++decode_graph_use_tick_;
+
+    const size_t meta_size = ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead();
+    fresh.meta.resize(meta_size);
+
+    struct ggml_init_params ggml_params = {
+        /*.mem_size   =*/ fresh.meta.size(),
+        /*.mem_buffer =*/ fresh.meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    fresh.ctx = ggml_init(ggml_params);
+    if (!fresh.ctx) {
+        error_msg_ = "Failed to initialize decode graph context";
+        return false;
+    }
+
+    fresh.gf = build_graph(fresh.ctx, n_frames);
+    if (!fresh.gf) {
+        free_decode_graph_entry(fresh);
+        error_msg_ = "Failed to build decode graph";
+        return false;
+    }
+
+    for (int cb = 0; cb < 16; ++cb) {
+        char name[32];
+        snprintf(name, sizeof(name), "codes_cb%d", cb);
+        fresh.cb_tensors[cb] = ggml_graph_get_tensor(fresh.gf, name);
+        if (!fresh.cb_tensors[cb]) {
+            free_decode_graph_entry(fresh);
+            error_msg_ = "Failed to cache codes tensor for codebook " + std::to_string(cb);
+            return false;
+        }
+        fresh.cb_codes[cb].assign(n_frames, 0);
+    }
+
+    fresh.positions = ggml_graph_get_tensor(fresh.gf, "positions");
+    fresh.audio = ggml_graph_get_tensor(fresh.gf, "audio");
+
+    if (!fresh.audio) {
+        free_decode_graph_entry(fresh);
+        error_msg_ = "Failed to cache audio tensor";
+        return false;
+    }
+
+    fresh.positions_buf.resize(n_frames);
+    for (int i = 0; i < n_frames; ++i) {
+        fresh.positions_buf[i] = i;
+    }
+
+    if ((int32_t)decode_graph_cache_.size() >= DECODE_GRAPH_CACHE_MAX) {
+        size_t victim = 0;
+        bool has_victim = false;
+        uint64_t min_tick = std::numeric_limits<uint64_t>::max();
+        for (size_t i = 0; i < decode_graph_cache_.size(); ++i) {
+            const auto & e = decode_graph_cache_[i];
+            if (!has_victim || e.use_tick < min_tick) {
+                min_tick = e.use_tick;
+                victim = i;
+                has_victim = true;
+            }
+        }
+
+        if (!has_victim) {
+            free_decode_graph_entry(fresh);
+            error_msg_ = "Failed to select graph cache victim";
+            return false;
+        }
+
+        if (decode_graph_cache_[victim].n_frames == active_decode_graph_frames_ && state_.sched) {
+            ggml_backend_sched_reset(state_.sched);
+            active_decode_graph_frames_ = -1;
+            for (auto & e : decode_graph_cache_) {
+                e.sched_allocated = false;
+                e.positions_uploaded = false;
+            }
+        }
+
+        free_decode_graph_entry(decode_graph_cache_[victim]);
+        decode_graph_cache_[victim] = std::move(fresh);
+        entry_out = &decode_graph_cache_[victim];
+    } else {
+        decode_graph_cache_.push_back(std::move(fresh));
+        entry_out = &decode_graph_cache_.back();
+    }
+
+    if (!entry_out || !entry_out->gf || !entry_out->ctx) {
+        error_msg_ = "Failed to cache decode graph entry";
         return false;
     }
 
@@ -660,16 +799,13 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
     return x;
 }
 
-struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
+struct ggml_cgraph * AudioTokenizerDecoder::build_graph(struct ggml_context * ctx0, int32_t n_frames) {
     const auto & cfg = model_.config;
-    
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-    
-    struct ggml_context * ctx0 = ggml_init(params);
+
+    if (!ctx0) {
+        error_msg_ = "Decode graph context is not initialized";
+        return nullptr;
+    }
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_DEC_MAX_NODES, false);
     
     static const char * cb_names[16] = {
@@ -836,9 +972,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
     ggml_set_output(cur);
     
     ggml_build_forward_expand(gf, cur);
-    
-    ggml_free(ctx0);
-    
+
     return gf;
 }
 
@@ -854,76 +988,98 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     const bool dec_dbg = decoder_debug_enabled();
     auto t0 = std::chrono::steady_clock::now();
 
-    codes_buf_.resize(n_frames * cfg.n_codebooks);
-    for (int f = 0; f < n_frames; ++f) {
-        for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
-            codes_buf_[cb + f * cfg.n_codebooks] = codes[f * cfg.n_codebooks + cb];
-        }
-    }
-    auto t_pack = std::chrono::steady_clock::now();
-    
-    struct ggml_cgraph * gf = build_graph(n_frames);
-    auto t_build = std::chrono::steady_clock::now();
-    
-    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
-        error_msg_ = "Failed to allocate graph";
+    decode_graph_cache_entry * graph = nullptr;
+    if (!ensure_decode_graph(n_frames, graph) || !graph) {
         return false;
     }
-    auto t_alloc = std::chrono::steady_clock::now();
-    
-    std::vector<int32_t> cb_codes(n_frames);
-    for (int cb = 0; cb < 16; ++cb) {
-        char name[32];
-        snprintf(name, sizeof(name), "codes_cb%d", cb);
-        struct ggml_tensor * cb_tensor = ggml_graph_get_tensor(gf, name);
-        if (!cb_tensor) {
-            error_msg_ = "Failed to find codes tensor for codebook " + std::to_string(cb);
-            ggml_backend_sched_reset(state_.sched);
+
+    auto t_build = std::chrono::steady_clock::now();
+
+    if (active_decode_graph_frames_ != n_frames) {
+        ggml_backend_sched_reset(state_.sched);
+        for (auto & e : decode_graph_cache_) {
+            e.sched_allocated = false;
+            e.positions_uploaded = false;
+        }
+        active_decode_graph_frames_ = n_frames;
+        graph->sched_allocated = false;
+    }
+
+    if (!graph->sched_allocated) {
+        apply_graph_backend_hints(*graph);
+        if (!ggml_backend_sched_alloc_graph(state_.sched, graph->gf)) {
+            error_msg_ = "Failed to allocate decode graph";
+            active_decode_graph_frames_ = -1;
+            graph->sched_allocated = false;
             return false;
         }
-        
-        for (int f = 0; f < n_frames; ++f) {
-            cb_codes[f] = codes_buf_[f * cfg.n_codebooks + cb];
+        graph->sched_allocated = true;
+    }
+
+    auto t_alloc = std::chrono::steady_clock::now();
+
+    auto t_pack = std::chrono::steady_clock::now();
+
+    for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+        struct ggml_tensor * cb_tensor = graph->cb_tensors[cb];
+        if (!cb_tensor) {
+            error_msg_ = "Failed to find codes tensor for codebook " + std::to_string(cb);
+            active_decode_graph_frames_ = -1;
+            graph->sched_allocated = false;
+            return false;
         }
-        
+
+        std::vector<int32_t> & cb_codes = graph->cb_codes[cb];
+        const int32_t * src = codes + cb;
+        int32_t * dst = cb_codes.data();
+        for (int f = 0; f < n_frames; ++f, src += cfg.n_codebooks) {
+            dst[f] = *src;
+        }
+
         ggml_backend_tensor_set(cb_tensor, cb_codes.data(), 0, n_frames * sizeof(int32_t));
     }
-    
 
-    
-    struct ggml_tensor * positions_tensor = ggml_graph_get_tensor(gf, "positions");
-    if (positions_tensor) {
-        std::vector<int32_t> positions(n_frames);
-        for (int i = 0; i < n_frames; ++i) {
-            positions[i] = i;
+    if (!graph->positions_uploaded) {
+        struct ggml_tensor * positions_tensor = graph->positions;
+        if (positions_tensor) {
+            ggml_backend_tensor_set(positions_tensor, graph->positions_buf.data(), 0,
+                                    n_frames * sizeof(int32_t));
         }
-        ggml_backend_tensor_set(positions_tensor, positions.data(), 0, 
-                                n_frames * sizeof(int32_t));
+        graph->positions_uploaded = true;
     }
     auto t_set = std::chrono::steady_clock::now();
-    
 
-    
-    if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(state_.sched, graph->gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
         ggml_backend_sched_reset(state_.sched);
+        for (auto & e : decode_graph_cache_) {
+            e.sched_allocated = false;
+            e.positions_uploaded = false;
+        }
+        active_decode_graph_frames_ = -1;
+        graph->sched_allocated = false;
         return false;
     }
     auto t_compute = std::chrono::steady_clock::now();
-    
-    struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
+
+    struct ggml_tensor * audio_tensor = graph->audio;
     if (!audio_tensor) {
         error_msg_ = "Failed to find audio tensor";
         ggml_backend_sched_reset(state_.sched);
+        for (auto & e : decode_graph_cache_) {
+            e.sched_allocated = false;
+            e.positions_uploaded = false;
+        }
+        active_decode_graph_frames_ = -1;
+        graph->sched_allocated = false;
         return false;
     }
-    
+
     int64_t n_samples = audio_tensor->ne[0];
-    samples.resize(n_samples);
+    samples.resize((size_t)n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
     auto t_get = std::chrono::steady_clock::now();
-    
-    ggml_backend_sched_reset(state_.sched);
+
     auto t_reset = std::chrono::steady_clock::now();
 
     if (dec_dbg) {
@@ -966,9 +1122,12 @@ bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames) {
     stream_state_.left_context_frames = left_context_frames;
     stream_state_.emitted_samples = 0;
     stream_state_.upsample_rate = 1920;
+    stream_state_.model_delay_samples = -1;
     stream_state_.total_frames = 0;
-    stream_state_.all_codes.clear();
-    stream_state_.all_codes.reserve((size_t)(left_context_frames + 16) * (size_t)cfg.n_codebooks);
+    stream_state_.history_limit_frames = std::max(16, left_context_frames + 16);
+    stream_state_.history_codes.clear();
+    stream_state_.history_codes.reserve((size_t)stream_state_.history_limit_frames * (size_t)cfg.n_codebooks);
+    stream_state_.decode_codes.clear();
     return true;
 }
 
@@ -1009,6 +1168,17 @@ bool AudioTokenizerDecoder::decode_chunk_with_context(const int32_t * chunk_code
     }
 
     out_samples.assign(decoded.begin() + cut, decoded.end());
+
+    if (stream_state_.model_delay_samples < 0 && n_context_frames > 0) {
+        const int64_t expected = (int64_t)n_chunk_frames * (int64_t)stream_state_.upsample_rate;
+        const int64_t actual = (int64_t)out_samples.size();
+        int64_t extra = actual - expected;
+        if (extra > 0) {
+            stream_state_.model_delay_samples = (int32_t)extra;
+        } else {
+            stream_state_.model_delay_samples = 0;
+        }
+    }
     return true;
 }
 
@@ -1027,26 +1197,47 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
     const int32_t n_codebooks = model_.config.n_codebooks;
     const int32_t processed_frames = stream_state_.total_frames;
     const int32_t n_ctx = std::min(stream_state_.left_context_frames, processed_frames);
+    const int32_t history_frames = std::min(stream_state_.history_limit_frames, processed_frames);
+
+    if (stream_state_.history_limit_frames < stream_state_.left_context_frames + n_new_frames + 8) {
+        stream_state_.history_limit_frames = stream_state_.left_context_frames + n_new_frames + 8;
+    }
 
     const int32_t n_decode_frames = n_ctx + n_new_frames;
-    std::vector<int32_t> chunk_codes((size_t)n_decode_frames * (size_t)n_codebooks);
+    stream_state_.decode_codes.resize((size_t)n_decode_frames * (size_t)n_codebooks);
 
     if (n_ctx > 0) {
-        const int32_t start_ctx_frame = processed_frames - n_ctx;
-        const int32_t * src_ctx = stream_state_.all_codes.data() + (size_t)start_ctx_frame * (size_t)n_codebooks;
-        std::copy(src_ctx, src_ctx + (size_t)n_ctx * (size_t)n_codebooks, chunk_codes.begin());
+        const int32_t keep_frames = (int32_t)(stream_state_.history_codes.size() / (size_t)n_codebooks);
+        if (keep_frames < n_ctx) {
+            error_msg_ = "Streaming history underflow";
+            return false;
+        }
+        const int32_t start_ctx_frame = keep_frames - n_ctx;
+        const int32_t * src_ctx = stream_state_.history_codes.data() + (size_t)start_ctx_frame * (size_t)n_codebooks;
+        std::copy(src_ctx, src_ctx + (size_t)n_ctx * (size_t)n_codebooks, stream_state_.decode_codes.begin());
     }
 
     std::copy(codes, codes + (size_t)n_new_frames * (size_t)n_codebooks,
-              chunk_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks);
+              stream_state_.decode_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks);
 
-    if (!decode_chunk_with_context(chunk_codes.data(), n_decode_frames, n_ctx, out_samples, false)) {
+    if (!decode_chunk_with_context(stream_state_.decode_codes.data(), n_decode_frames, n_ctx, out_samples, false)) {
         return false;
     }
 
-    stream_state_.all_codes.insert(stream_state_.all_codes.end(),
-                                   codes,
-                                   codes + (size_t)n_new_frames * (size_t)n_codebooks);
+    stream_state_.history_codes.insert(stream_state_.history_codes.end(),
+                                       codes,
+                                       codes + (size_t)n_new_frames * (size_t)n_codebooks);
+
+    if (history_frames > 0) {
+        const int32_t keep_after = std::max(stream_state_.history_limit_frames, history_frames + n_new_frames);
+        const size_t keep_codes = (size_t)keep_after * (size_t)n_codebooks;
+        if (stream_state_.history_codes.size() > keep_codes) {
+            const size_t drop = stream_state_.history_codes.size() - keep_codes;
+            stream_state_.history_codes.erase(stream_state_.history_codes.begin(),
+                                              stream_state_.history_codes.begin() + (ptrdiff_t)drop);
+        }
+    }
+
     stream_state_.total_frames += n_new_frames;
     stream_state_.emitted_samples += (int64_t)out_samples.size();
 
@@ -1071,28 +1262,11 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
         return true;
     }
 
-    if (full_flush && stream_state_.total_frames > 0) {
-        const int32_t n_codebooks = model_.config.n_codebooks;
-        if ((size_t)stream_state_.total_frames * (size_t)n_codebooks > stream_state_.all_codes.size()) {
-            stream_state_.active = false;
-            error_msg_ = "Internal stream state is inconsistent";
-            return false;
-        }
-
-        std::vector<int32_t> final_codes((size_t)stream_state_.total_frames * (size_t)n_codebooks);
-        std::copy(stream_state_.all_codes.end() - (ptrdiff_t)final_codes.size(),
-                  stream_state_.all_codes.end(),
-                  final_codes.begin());
-
-        if (!decode_chunk_with_context(final_codes.data(), stream_state_.total_frames, 0, tail_samples, true)) {
-            stream_state_.active = false;
-            return false;
-        }
-
-        if (stream_state_.emitted_samples > 0 && (size_t)stream_state_.emitted_samples < tail_samples.size()) {
-            tail_samples.erase(tail_samples.begin(), tail_samples.begin() + stream_state_.emitted_samples);
-        } else {
-            tail_samples.clear();
+    if (full_flush && stream_state_.total_frames > 0 && stream_state_.model_delay_samples > 0) {
+        const int32_t n_delay = std::min<int32_t>(stream_state_.model_delay_samples,
+                                                  std::max<int32_t>(0, stream_state_.upsample_rate * 4));
+        if (n_delay > 0) {
+            tail_samples.assign((size_t)n_delay, 0.0f);
         }
     }
 
@@ -1100,8 +1274,24 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
     stream_state_.left_context_frames = 4;
     stream_state_.emitted_samples = 0;
     stream_state_.upsample_rate = 1;
+    stream_state_.model_delay_samples = -1;
     stream_state_.total_frames = 0;
-    stream_state_.all_codes.clear();
+    stream_state_.history_limit_frames = std::max(16, stream_state_.left_context_frames + 16);
+    stream_state_.history_codes.clear();
+    stream_state_.decode_codes.clear();
+    return true;
+}
+
+bool AudioTokenizerDecoder::set_stream_left_context(int32_t left_context_frames) {
+    if (!stream_state_.active) {
+        error_msg_ = "Streaming session not started";
+        return false;
+    }
+    if (left_context_frames < 0) {
+        left_context_frames = 0;
+    }
+    stream_state_.left_context_frames = left_context_frames;
+    stream_state_.history_limit_frames = std::max(stream_state_.history_limit_frames, left_context_frames + 8);
     return true;
 }
 

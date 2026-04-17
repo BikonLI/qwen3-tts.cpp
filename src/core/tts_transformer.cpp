@@ -179,6 +179,10 @@ bool TTSTransformer::set_n_threads(int32_t n_threads) {
     return true;
 }
 
+void TTSTransformer::set_talker_attention_window(int32_t window_tokens) {
+    talker_attention_window_ = std::max(0, window_tokens);
+}
+
 bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_path) {
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();
@@ -1389,7 +1393,7 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
+struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t attn_window) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1471,15 +1475,17 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
         
-        int n_kv = n_past + n_tokens;
+        const int n_kv_total = n_past + n_tokens;
+        const int n_kv = (attn_window > 0) ? std::min(n_kv_total, attn_window) : n_kv_total;
+        const int kv_start = n_kv_total - n_kv;
         
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_kv,
-            k_cache->nb[1], k_cache->nb[2], 0);
+            k_cache->nb[1], k_cache->nb[2], kv_start * k_cache->nb[2]);
         
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_kv,
-            v_cache->nb[1], v_cache->nb[2], 0);
+            v_cache->nb[1], v_cache->nb[2], kv_start * v_cache->nb[2]);
         
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
@@ -1487,7 +1493,8 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         
         struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
         KQ = ggml_scale(ctx0, KQ, KQscale);
-        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
+        const int n_past_mask = n_kv - n_tokens;
+        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past_mask);
         KQ = ggml_soft_max(ctx0, KQ);
         
         V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
@@ -2176,7 +2183,7 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    struct ggml_cgraph * gf = build_step_graph(n_past);
+    struct ggml_cgraph * gf = build_step_graph(n_past, talker_attention_window_);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

@@ -362,12 +362,14 @@ struct StreamRunStats {
     size_t n_samples = 0;
     int32_t sample_rate = 24000;
     int32_t dropped_chunks = 0;
+    int64_t wall_ms = 0;
 };
 
 static bool run_stream_session(
     const std::shared_ptr<qwen3_tts::tts_stream_session> &session,
-    const std::string &stream_save_file,
+    const std::string &output_file,
     int32_t poll_timeout_ms,
+    bool playback_enabled,
     StreamRunStats &stats,
     std::string &error_msg
 ) {
@@ -431,27 +433,29 @@ static bool run_stream_session(
                 stats.sample_rate = chunk.sample_rate;
             }
 
-            if (!stream_save_file.empty() && !writer_opened) {
-                if (!writer.open(stream_save_file, stats.sample_rate, error_msg)) {
+            if (!output_file.empty() && !writer_opened) {
+                if (!writer.open(output_file, stats.sample_rate, error_msg)) {
                     return false;
                 }
                 writer_opened = true;
             }
 
             if (!chunk.audio.empty()) {
-                if (!player_opened) {
+                if (playback_enabled && !player_opened) {
                     if (!player.open(stats.sample_rate, error_msg)) {
                         return false;
                     }
                     player_opened = true;
                 }
 
-                auto t_push0 = std::chrono::steady_clock::now();
-                if (!player.push(chunk.audio, error_msg)) {
-                    return false;
+                if (playback_enabled) {
+                    auto t_push0 = std::chrono::steady_clock::now();
+                    if (!player.push(chunk.audio, error_msg)) {
+                        return false;
+                    }
+                    auto t_push1 = std::chrono::steady_clock::now();
+                    push_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_push1 - t_push0).count();
                 }
-                auto t_push1 = std::chrono::steady_clock::now();
-                push_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_push1 - t_push0).count();
 
                 auto t_wav0 = std::chrono::steady_clock::now();
                 if (writer_opened && !writer.append(chunk.audio, error_msg)) {
@@ -493,10 +497,11 @@ static bool run_stream_session(
     }
 
     stats.dropped_chunks = std::max(stats.dropped_chunks, session->dropped_chunks());
+    auto t_stream_end = std::chrono::steady_clock::now();
+    stats.wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_stream_end - t_stream_start).count();
 
     if (stream_dbg) {
-        auto t_stream_end = std::chrono::steady_clock::now();
-        int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_stream_end - t_stream_start).count();
+        int64_t total_ms = stats.wall_ms;
         double avg_chunk_ms = 0.0;
         if (n_chunks > 0 && stats.sample_rate > 0) {
             avg_chunk_ms = ((double)total_chunk_samples * 1000.0 / (double)stats.sample_rate) / (double)n_chunks;
@@ -528,7 +533,7 @@ void print_usage(const char *program) {
     fprintf(stderr, "  -t,  --text <text|file>           Input text (or a file path)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Optional:\n");
-    fprintf(stderr, "  -o, --output <wav>                Output WAV file; omit to play audio\n");
+    fprintf(stderr, "  -o, --output <wav>                Output WAV file; omit to play audio (stream/non-stream)\n");
     fprintf(stderr, "  -r, --reference <wav>             Reference audio for voice clone\n");
     fprintf(stderr, "  --ref-text <text>                 Reference transcript for voice clone\n");
     fprintf(stderr, "  --x-vector-only                   Voice clone without reference_text\n");
@@ -541,9 +546,24 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --max-tokens <n>                  Max audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repetition-penalty <v>          Repetition penalty (default: 1.05)\n");
     fprintf(stderr, "  --stream                          Enable streaming generation/playback\n");
-    fprintf(stderr, "  --stream-save <wav>               Save streamed audio while playing\n");
+    fprintf(stderr, "  --stream-realtime                 Enable strict realtime preset (RTF-first)\n");
+    fprintf(stderr, "  --stream-no-playback              Disable playback (benchmark mode)\n");
+    fprintf(stderr, "  --stream-playback                 Enable playback (default)\n");
     fprintf(stderr, "  --stream-chunk-frames <n>         Frames per streamed chunk (default: 4)\n");
     fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 4)\n");
+    fprintf(stderr, "  --stream-talker-window <n>        Talker attention window for stream (default: 512)\n");
+    fprintf(stderr, "  --talker-window <n>               Talker attention window for non-stream (default: 0=full)\n");
+    fprintf(stderr, "  --stream-parallel-decode          Decode in parallel worker (default: on)\n");
+    fprintf(stderr, "  --stream-no-parallel-decode       Disable parallel decode worker\n");
+    fprintf(stderr, "  --stream-drop-oldest              Drop oldest chunk on queue overflow\n");
+    fprintf(stderr, "  --stream-block-on-full            Block producer on queue overflow (default)\n");
+    fprintf(stderr, "  --stream-adaptive                Enable adaptive chunk/context tuning\n");
+    fprintf(stderr, "  --stream-no-adaptive             Disable adaptive chunk/context tuning\n");
+    fprintf(stderr, "  --stream-chunk-min <n>           Adaptive chunk lower bound (default: 2)\n");
+    fprintf(stderr, "  --stream-chunk-max <n>           Adaptive chunk upper bound (default: 16)\n");
+    fprintf(stderr, "  --stream-left-context-min <n>    Adaptive context lower bound (default: 2)\n");
+    fprintf(stderr, "  --stream-adapt-high <ratio>      Expand chunk/reduce ctx threshold (default: 1.15)\n");
+    fprintf(stderr, "  --stream-adapt-low <ratio>       Recover quality threshold (default: 0.65)\n");
     fprintf(stderr, "  --stream-queue-cap <n>            Stream queue capacity (default: 8)\n");
     fprintf(stderr, "  --stream-poll-timeout <ms>        Poll timeout for stream client (default: 100)\n");
     fprintf(stderr, "  -j, --threads <n>                 Number of threads\n");
@@ -559,6 +579,7 @@ void print_usage(const char *program) {
     fprintf(stderr, "  %s -m models/gguf/0.6b-base/qwen3-tts-12hz-0.6b-base-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
     fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice/qwen3-tts-12hz-1.7b-custom-voice-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
     fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design/qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/0.6b-custom-voice/qwen3-tts-12hz-0.6b-custom-voice-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \".\\text\\test1.txt\" --speaker ryan --stream\n", program);
 }
 
 } // namespace
@@ -573,13 +594,25 @@ int main(int argc, char **argv) {
     std::string reference_text;
     std::string speaker;
     std::string instruct;
-    std::string stream_save_file;
 
     bool stream_mode = false;
+    bool stream_realtime = false;
+    bool stream_playback = true;
+    bool stream_no_playback_requested = false;
     int32_t stream_chunk_frames = 4;
     int32_t stream_queue_cap = 8;
     int32_t stream_poll_timeout = 100;
     int32_t stream_decoder_left_context = 4;
+    int32_t stream_talker_attention_window = 512;
+    bool stream_parallel_decode = true;
+    bool stream_drop_oldest_on_overflow = false;
+    bool stream_adaptive_tuning = true;
+    int32_t stream_chunk_min = 2;
+    int32_t stream_chunk_max = 16;
+    int32_t stream_left_context_min = 2;
+    float stream_adapt_high = 1.15f;
+    float stream_adapt_low = 0.65f;
+    int32_t talker_attention_window = 0;
 
     qwen3_tts::tts_params params;
 
@@ -682,12 +715,36 @@ int main(int argc, char **argv) {
             params.repetition_penalty = std::stof(argv[i]);
         } else if (arg == "--stream") {
             stream_mode = true;
-        } else if (arg == "--stream-save") {
+        } else if (arg == "--stream-realtime") {
+            stream_mode = true;
+            stream_realtime = true;
+        } else if (arg == "--stream-no-playback") {
+            stream_mode = true;
+            stream_playback = false;
+            stream_no_playback_requested = true;
+        } else if (arg == "--stream-playback") {
+            stream_playback = true;
+            stream_no_playback_requested = false;
+        } else if (arg == "--talker-window") {
             if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-save value\n");
+                fprintf(stderr, "Error: missing --talker-window value\n");
                 return 1;
             }
-            stream_save_file = argv[i];
+            talker_attention_window = std::max(0, std::stoi(argv[i]));
+        } else if (arg == "--stream-talker-window") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-talker-window value\n");
+                return 1;
+            }
+            stream_talker_attention_window = std::max(0, std::stoi(argv[i]));
+        } else if (arg == "--stream-parallel-decode") {
+            stream_parallel_decode = true;
+        } else if (arg == "--stream-no-parallel-decode") {
+            stream_parallel_decode = false;
+        } else if (arg == "--stream-drop-oldest") {
+            stream_drop_oldest_on_overflow = true;
+        } else if (arg == "--stream-block-on-full") {
+            stream_drop_oldest_on_overflow = false;
         } else if (arg == "--stream-chunk-frames") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --stream-chunk-frames value\n");
@@ -712,6 +769,40 @@ int main(int argc, char **argv) {
                 return 1;
             }
             stream_decoder_left_context = std::max(0, std::stoi(argv[i]));
+        } else if (arg == "--stream-adaptive") {
+            stream_adaptive_tuning = true;
+        } else if (arg == "--stream-no-adaptive") {
+            stream_adaptive_tuning = false;
+        } else if (arg == "--stream-chunk-min") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-chunk-min value\n");
+                return 1;
+            }
+            stream_chunk_min = std::max(1, std::stoi(argv[i]));
+        } else if (arg == "--stream-chunk-max") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-chunk-max value\n");
+                return 1;
+            }
+            stream_chunk_max = std::max(1, std::stoi(argv[i]));
+        } else if (arg == "--stream-left-context-min") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-left-context-min value\n");
+                return 1;
+            }
+            stream_left_context_min = std::max(0, std::stoi(argv[i]));
+        } else if (arg == "--stream-adapt-high") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-adapt-high value\n");
+                return 1;
+            }
+            stream_adapt_high = std::stof(argv[i]);
+        } else if (arg == "--stream-adapt-low") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-adapt-low value\n");
+                return 1;
+            }
+            stream_adapt_low = std::stof(argv[i]);
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --threads value\n");
@@ -723,6 +814,42 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    params.talker_attention_window = talker_attention_window;
+
+    if (stream_realtime) {
+        // Strict realtime preset: prioritize RTF and smoothness over diversity.
+        params.temperature = 0.0f;
+        params.top_k = 0;
+        params.top_p = 1.0f;
+        params.repetition_penalty = 1.0f;
+
+        stream_chunk_frames = std::max(stream_chunk_frames, 12);
+        stream_chunk_min = std::max(stream_chunk_min, 8);
+        stream_chunk_max = std::max(stream_chunk_max, 24);
+        stream_decoder_left_context = std::min(stream_decoder_left_context, 2);
+        stream_left_context_min = std::min(stream_left_context_min, 2);
+        stream_queue_cap = std::max(stream_queue_cap, 24);
+        stream_parallel_decode = true;
+        stream_drop_oldest_on_overflow = false;
+        if (stream_talker_attention_window <= 0) {
+            stream_talker_attention_window = 512;
+        }
+
+        fprintf(stderr,
+                "[stream-realtime] preset applied: temp=0 top_k=0 top_p=1 rep=1 chunk=%d ctx=%d queue=%d talker_window=%d\n",
+                stream_chunk_frames,
+                stream_decoder_left_context,
+                stream_queue_cap,
+                stream_talker_attention_window);
+    }
+
+    if (stream_mode && stream_no_playback_requested && output_file.empty()) {
+        fprintf(
+            stderr,
+            "[stream] --stream-no-playback is enabled: audio playback is disabled (benchmark mode). Use --stream-playback or remove --stream-no-playback to hear audio.\n"
+        );
     }
 
     if (model_path_arg.empty()) {
@@ -780,8 +907,20 @@ int main(int argc, char **argv) {
         stream_params.stream_chunk_frames = stream_chunk_frames;
         stream_params.stream_queue_capacity = stream_queue_cap;
         stream_params.stream_poll_timeout_ms = stream_poll_timeout;
-        stream_params.stream_full_flush = true;
+        stream_params.stream_full_flush = false;
         stream_params.stream_decoder_left_context_frames = stream_decoder_left_context;
+        stream_params.stream_talker_attention_window = stream_talker_attention_window;
+        stream_params.stream_adaptive_tuning = stream_adaptive_tuning;
+        stream_params.stream_chunk_frames_min = stream_chunk_min;
+        stream_params.stream_chunk_frames_max = std::max(stream_chunk_min, stream_chunk_max);
+        stream_params.stream_left_context_frames_min = stream_left_context_min;
+        stream_params.stream_adaptive_high_ratio = std::max(0.1f, stream_adapt_high);
+        stream_params.stream_adaptive_low_ratio = std::max(0.05f, stream_adapt_low);
+        stream_params.stream_parallel_decode = stream_parallel_decode;
+        stream_params.stream_drop_oldest_on_overflow = stream_drop_oldest_on_overflow;
+        if (stream_params.stream_adaptive_low_ratio > stream_params.stream_adaptive_high_ratio) {
+            stream_params.stream_adaptive_low_ratio = stream_params.stream_adaptive_high_ratio;
+        }
 
         std::shared_ptr<qwen3_tts::tts_stream_session> session;
         if (!reference_audio.empty()) {
@@ -830,23 +969,31 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        const bool stream_playback_enabled = output_file.empty() ? stream_playback : false;
+
         StreamRunStats stats;
         std::string stream_error;
-        if (!run_stream_session(session, stream_save_file, stream_poll_timeout, stats, stream_error)) {
+        if (!run_stream_session(session, output_file, stream_poll_timeout, stream_playback_enabled, stats, stream_error)) {
             fprintf(stderr, "Error: %s\n", stream_error.c_str());
             return 1;
         }
 
-        if (!stream_save_file.empty()) {
-            fprintf(stderr, "Stream output saved to: %s\n", stream_save_file.c_str());
+        if (!output_file.empty()) {
+            fprintf(stderr, "Output saved to: %s\n", output_file.c_str());
         }
 
+        const double stream_audio_sec =
+            stats.sample_rate > 0 ? (double)stats.n_samples / (double)stats.sample_rate : 0.0;
+        const double stream_rtf =
+            stream_audio_sec > 0.0 ? ((double)stats.wall_ms / 1000.0) / stream_audio_sec : 0.0;
         fprintf(
             stderr,
-            "Done(stream). sample_rate=%d, samples=%zu, audio_sec=%.2f, dropped_chunks=%d\n",
+            "Done(stream). sample_rate=%d, samples=%zu, audio_sec=%.2f, wall_sec=%.2f, rtf=%.3f, dropped_chunks=%d\n",
             stats.sample_rate,
             stats.n_samples,
-            stats.sample_rate > 0 ? (double)stats.n_samples / (double)stats.sample_rate : 0.0,
+            stream_audio_sec,
+            (double)stats.wall_ms / 1000.0,
+            stream_rtf,
             stats.dropped_chunks
         );
         return 0;
@@ -901,13 +1048,7 @@ int main(int argc, char **argv) {
     }
 
     if (output_file.empty()) {
-        if (!stream_save_file.empty()) {
-            if (!qwen3_tts::save_audio_file(stream_save_file, result.audio, result.sample_rate)) {
-                fprintf(stderr, "Error: failed to save --stream-save file: %s\n", stream_save_file.c_str());
-                return 1;
-            }
-            fprintf(stderr, "Output saved to: %s\n", stream_save_file.c_str());
-        } else if (!qwen3_tts::play_audio(result.audio, result.sample_rate)) {
+        if (!qwen3_tts::play_audio(result.audio, result.sample_rate)) {
             fprintf(stderr, "Error: playback failed\n");
             return 1;
         }

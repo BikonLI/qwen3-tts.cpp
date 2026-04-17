@@ -289,6 +289,10 @@ public:
     
     const tts_transformer_config & get_config() const { return model_.config; }
 
+    // Limit talker decode attention to the latest N cached tokens.
+    // 0 disables the limit.
+    void set_talker_attention_window(int32_t window_tokens);
+
     // Configure backend thread count when supported by selected backend.
     // n_threads <= 0 keeps backend defaults.
     bool set_n_threads(int32_t n_threads);
@@ -322,7 +326,7 @@ private:
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 
-    struct ggml_cgraph * build_step_graph(int32_t n_past);
+    struct ggml_cgraph * build_step_graph(int32_t n_past, int32_t attn_window);
 
     bool project_text_tokens(const int32_t * text_tokens, int32_t n_tokens,
                              std::vector<float> & output);
@@ -366,6 +370,7 @@ private:
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
     bool skip_ggml_code_pred_layers_ = false;
+    int32_t talker_attention_window_ = 0;
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;

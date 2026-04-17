@@ -17,6 +17,11 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <limits>
+#include <thread>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -28,6 +33,166 @@
 namespace qwen3_tts {
 
     namespace fs = std::filesystem;
+
+    struct tts_stream_session::impl {
+        ~impl() {
+            if (worker.joinable()) {
+                if (worker.get_id() == std::this_thread::get_id()) {
+                    worker.detach();
+                } else {
+                    worker.join();
+                }
+            }
+        }
+
+        mutable std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<tts_audio_chunk> queue;
+        int32_t queue_capacity = 8;
+        int32_t default_poll_timeout_ms = 100;
+        int32_t dropped_chunks = 0;
+        bool finished = false;
+        bool has_error = false;
+        std::string error_msg;
+        int64_t next_chunk_id = 0;
+        std::thread worker;
+    };
+
+    tts_stream_session::tts_stream_session(const std::shared_ptr<impl> &impl_ptr)
+        : impl_(impl_ptr) {
+    }
+
+    tts_stream_session::~tts_stream_session() = default;
+
+    tts_stream_poll_status tts_stream_session::poll(tts_audio_chunk &chunk, int32_t timeout_ms) {
+        if (!impl_) {
+            return tts_stream_poll_status::error;
+        }
+
+        std::unique_lock<std::mutex> lock(impl_->mutex);
+        const int32_t wait_ms = timeout_ms >= 0 ? timeout_ms : impl_->default_poll_timeout_ms;
+
+        if (impl_->queue.empty() && !impl_->finished && !impl_->has_error) {
+            if (wait_ms > 0) {
+                impl_->cv.wait_for(lock, std::chrono::milliseconds(wait_ms), [&]() {
+                    return !impl_->queue.empty() || impl_->finished || impl_->has_error;
+                });
+            }
+        }
+
+        if (!impl_->queue.empty()) {
+            chunk = std::move(impl_->queue.front());
+            impl_->queue.pop_front();
+            return tts_stream_poll_status::chunk;
+        }
+
+        if (impl_->has_error) {
+            return tts_stream_poll_status::error;
+        }
+
+        if (impl_->finished) {
+            return tts_stream_poll_status::finished;
+        }
+
+        return tts_stream_poll_status::timeout;
+    }
+
+    bool tts_stream_session::is_finished() const {
+        if (!impl_) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        return impl_->finished && impl_->queue.empty();
+    }
+
+    bool tts_stream_session::has_error() const {
+        if (!impl_) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        return impl_->has_error;
+    }
+
+    std::string tts_stream_session::get_error() const {
+        if (!impl_) {
+            return {};
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        return impl_->error_msg;
+    }
+
+    int32_t tts_stream_session::dropped_chunks() const {
+        if (!impl_) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        return impl_->dropped_chunks;
+    }
+
+    static void stream_set_error(const std::shared_ptr<tts_stream_session::impl> &impl,
+                                 const std::string &error_msg) {
+        if (!impl) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            if (!impl->has_error) {
+                impl->error_msg = error_msg;
+            }
+            impl->has_error = true;
+            impl->finished = true;
+        }
+        impl->cv.notify_all();
+    }
+
+    static void stream_mark_finished(const std::shared_ptr<tts_stream_session::impl> &impl) {
+        if (!impl) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->finished = true;
+        }
+        impl->cv.notify_all();
+    }
+
+    static bool stream_emit_chunk(const std::shared_ptr<tts_stream_session::impl> &impl,
+                                  tts_audio_chunk chunk,
+                                  const tts_stream_callbacks &callbacks) {
+        if (!impl) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            const int32_t capacity = std::max(1, impl->queue_capacity);
+            while ((int32_t)impl->queue.size() >= capacity) {
+                impl->queue.pop_front();
+                impl->dropped_chunks++;
+            }
+            chunk.chunk_id = impl->next_chunk_id++;
+            chunk.dropped_before = impl->dropped_chunks;
+            impl->queue.push_back(chunk);
+        }
+        impl->cv.notify_all();
+
+        if (callbacks.on_audio_chunk) {
+            try {
+                callbacks.on_audio_chunk(chunk);
+            } catch (...) {
+                stream_set_error(impl, "Streaming audio callback threw an exception");
+                if (callbacks.on_error) {
+                    try {
+                        callbacks.on_error("Streaming audio callback threw an exception");
+                    } catch (...) {
+                    }
+                }
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     static std::string to_lower_copy(const std::string &s) {
         std::string out = s;
@@ -321,7 +486,21 @@ namespace qwen3_tts {
           audio_decoder_(std::make_unique<AudioTokenizerDecoder>()) {
     }
 
-    Qwen3TTS::~Qwen3TTS() = default;
+    Qwen3TTS::~Qwen3TTS() {
+        std::shared_ptr<tts_stream_session::impl> stream_impl;
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_impl = stream_impl_;
+            stream_impl_.reset();
+        }
+        if (stream_impl && stream_impl->worker.joinable()) {
+            if (stream_impl->worker.get_id() == std::this_thread::get_id()) {
+                stream_impl->worker.detach();
+            } else {
+                stream_impl->worker.join();
+            }
+        }
+    }
 
     bool Qwen3TTS::load_models(const std::string &model_dir) {
         std::string tts_model_path;
@@ -608,6 +787,14 @@ namespace qwen3_tts {
     tts_result Qwen3TTS::synthesize_internal(
         const std::string &text, const float *speaker_embedding, const tts_params &params, tts_result &result
     ) {
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            if (stream_active_) {
+                result.error_msg = "Streaming session is active; concurrent non-stream synthesis is not supported";
+                return result;
+            }
+        }
+
         if (loaded_model_variant_ != tts_model_variant::auto_variant &&
             params.model_variant != tts_model_variant::auto_variant &&
             params.model_variant != loaded_model_variant_) {
@@ -881,6 +1068,503 @@ namespace qwen3_tts {
 
     void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
         progress_callback_ = callback;
+    }
+
+    std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_stream(
+        const std::string &text,
+        const tts_stream_params &params,
+        const tts_stream_callbacks &callbacks
+    ) {
+        if (!models_loaded_) {
+            error_msg_ = "Models not loaded";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        const int32_t hidden_size = loaded_hidden_size_ > 0 ? loaded_hidden_size_ : transformer_->get_config().hidden_size;
+        if (hidden_size <= 0) {
+            error_msg_ = "Invalid hidden size for streaming";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        std::vector<float> zero_embedding((size_t)hidden_size, 0.0f);
+        return synthesize_stream_internal(text, zero_embedding, true, params, callbacks);
+    }
+
+    std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_with_voice_stream(
+        const std::string &text,
+        const std::string &reference_audio,
+        const tts_stream_params &params,
+        const tts_stream_callbacks &callbacks
+    ) {
+        if (params.tts.task_type == tts_task_type::voice_clone &&
+            !params.tts.x_vector_only_mode &&
+            params.tts.reference_text.empty()) {
+            error_msg_ = "voice_clone task requires reference_text when x_vector_only_mode is false";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        std::vector<float> ref_samples;
+        int ref_sample_rate = 0;
+        if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+            error_msg_ = "Failed to load reference audio: " + reference_audio;
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        const int target_rate = 24000;
+        if (ref_sample_rate != target_rate) {
+            std::vector<float> resampled;
+            resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
+            ref_samples = std::move(resampled);
+        }
+
+        return synthesize_with_voice_stream(text, ref_samples.data(), (int32_t)ref_samples.size(), params, callbacks);
+    }
+
+    std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_with_voice_stream(
+        const std::string &text,
+        const float *ref_samples,
+        int32_t n_ref_samples,
+        const tts_stream_params &params,
+        const tts_stream_callbacks &callbacks
+    ) {
+        if (!models_loaded_) {
+            error_msg_ = "Models not loaded";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        if (!ref_samples || n_ref_samples <= 0) {
+            error_msg_ = "Invalid reference samples";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        if (!encoder_loaded_) {
+            if (tts_model_path_.empty()) {
+                error_msg_ = "Internal error: missing TTS model path for lazy encoder load";
+                if (callbacks.on_error) {
+                    callbacks.on_error(error_msg_);
+                }
+                return nullptr;
+            }
+            if (!audio_encoder_->load_model(tts_model_path_)) {
+                error_msg_ = "Failed to load speaker encoder: " + audio_encoder_->get_error();
+                if (callbacks.on_error) {
+                    callbacks.on_error(error_msg_);
+                }
+                return nullptr;
+            }
+            encoder_loaded_ = true;
+        }
+
+        if (params.tts.n_threads > 0 && !audio_encoder_->set_n_threads(params.tts.n_threads)) {
+            error_msg_ = "Failed to set speaker encoder thread count: " + audio_encoder_->get_error();
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        std::vector<float> speaker_embedding;
+        if (!audio_encoder_->encode(ref_samples, n_ref_samples, speaker_embedding)) {
+            error_msg_ = "Failed to extract speaker embedding: " + audio_encoder_->get_error();
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        return synthesize_stream_internal(text, speaker_embedding, true, params, callbacks);
+    }
+
+    std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_with_embedding_stream(
+        const std::string &text,
+        const float *embedding,
+        int32_t embedding_size,
+        const tts_stream_params &params,
+        const tts_stream_callbacks &callbacks
+    ) {
+        if (!models_loaded_) {
+            error_msg_ = "Models not loaded";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        if (!embedding || embedding_size <= 0) {
+            error_msg_ = "Invalid speaker embedding";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        std::vector<float> speaker_embedding((size_t)embedding_size);
+        std::copy(embedding, embedding + embedding_size, speaker_embedding.begin());
+        return synthesize_stream_internal(text, speaker_embedding, true, params, callbacks);
+    }
+
+    std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_stream_internal(
+        const std::string &text,
+        const std::vector<float> &speaker_embedding,
+        bool has_speaker_embedding,
+        const tts_stream_params &params,
+        const tts_stream_callbacks &callbacks
+    ) {
+        if (!models_loaded_) {
+            error_msg_ = "Models not loaded";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+        if (text.empty()) {
+            error_msg_ = "Input text is empty";
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            if (stream_active_) {
+                error_msg_ = "Another streaming session is already active";
+                if (callbacks.on_error) {
+                    callbacks.on_error(error_msg_);
+                }
+                return nullptr;
+            }
+            stream_active_ = true;
+        }
+
+        auto impl = std::make_shared<tts_stream_session::impl>();
+        impl->queue_capacity = std::max(1, params.stream_queue_capacity);
+        impl->default_poll_timeout_ms = std::max(0, params.stream_poll_timeout_ms);
+
+        std::shared_ptr<tts_stream_session> session(new tts_stream_session(impl));
+
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_impl_ = impl;
+        }
+
+        try {
+            impl->worker = std::thread([this, impl, callbacks, text, speaker_embedding, has_speaker_embedding, params]() {
+                struct stream_active_reset {
+                    Qwen3TTS * self;
+                    ~stream_active_reset() {
+                        std::lock_guard<std::mutex> lock(self->stream_mutex_);
+                        self->stream_active_ = false;
+                        self->stream_impl_.reset();
+                    }
+                } active_reset{this};
+
+                auto report_error = [&](const std::string &msg) {
+                    {
+                        std::lock_guard<std::mutex> lock(stream_mutex_);
+                        error_msg_ = msg;
+                    }
+                    stream_set_error(impl, msg);
+                    if (callbacks.on_error) {
+                        try {
+                            callbacks.on_error(msg);
+                        } catch (...) {
+                        }
+                    }
+                };
+
+                tts_params p = params.tts;
+
+                if (loaded_model_variant_ != tts_model_variant::auto_variant &&
+                    p.model_variant != tts_model_variant::auto_variant &&
+                    p.model_variant != loaded_model_variant_) {
+                    report_error(std::string("Requested --model-variant '") +
+                                 variant_name(p.model_variant) +
+                                 "' does not match loaded model variant '" +
+                                 variant_name(loaded_model_variant_) +
+                                 "'.");
+                    return;
+                }
+
+                tts_model_variant effective_variant =
+                    (p.model_variant != tts_model_variant::auto_variant) ? p.model_variant : loaded_model_variant_;
+                if (effective_variant == tts_model_variant::auto_variant) {
+                    effective_variant = tts_model_variant::base;
+                }
+
+                if (p.task_type != tts_task_type::auto_task &&
+                    loaded_model_variant_ != tts_model_variant::auto_variant) {
+                    bool compatible = true;
+                    switch (p.task_type) {
+                        case tts_task_type::voice_clone:
+                            compatible = (loaded_model_variant_ == tts_model_variant::base);
+                            break;
+                        case tts_task_type::custom_voice:
+                            compatible = (loaded_model_variant_ == tts_model_variant::custom_voice);
+                            break;
+                        case tts_task_type::voice_design:
+                            compatible = (loaded_model_variant_ == tts_model_variant::voice_design);
+                            break;
+                        default:
+                            compatible = true;
+                            break;
+                    }
+                    if (!compatible) {
+                        report_error(std::string("Task '") + task_name(p.task_type) +
+                                     "' is incompatible with loaded model variant '" +
+                                     variant_name(loaded_model_variant_) + "'.");
+                        return;
+                    }
+                }
+
+                if (p.task_type == tts_task_type::voice_design &&
+                    effective_variant != tts_model_variant::voice_design) {
+                    report_error(std::string("voice_design task requires voice_design model variant, got ") +
+                                 variant_name(effective_variant));
+                    return;
+                }
+
+                if (p.task_type == tts_task_type::custom_voice &&
+                    effective_variant == tts_model_variant::base) {
+                    report_error("custom_voice task requires custom_voice or voice_design variant");
+                    return;
+                }
+
+                int32_t effective_language_id = p.language_id;
+                int32_t speaker_codec_id = -1;
+                const bool use_custom_voice_speaker =
+                    (p.task_type == tts_task_type::custom_voice ||
+                     effective_variant == tts_model_variant::custom_voice);
+                if (use_custom_voice_speaker) {
+                    const std::string speaker_lower = to_lower_copy(p.speaker);
+                    if (speaker_lower.empty()) {
+                        report_error("speaker is required for custom_voice");
+                        return;
+                    }
+                    if (!is_supported_custom_voice_speaker(speaker_lower)) {
+                        report_error("Unsupported speaker: " + p.speaker);
+                        return;
+                    }
+                    if (!map_custom_voice_speaker_codec_id(speaker_lower, speaker_codec_id)) {
+                        report_error("Unsupported speaker: " + p.speaker);
+                        return;
+                    }
+                    effective_language_id = map_dialect_language_if_needed(speaker_lower, effective_language_id);
+                }
+
+                std::vector<int32_t> text_tokens = tokenizer_->encode_for_tts(
+                    text,
+                    "",
+                    p.speaker,
+                    p.reference_text
+                );
+                std::vector<int32_t> instruct_tokens = tokenizer_->encode_instruct_for_tts(p.instruct);
+                if (text_tokens.empty()) {
+                    report_error("Failed to tokenize text");
+                    return;
+                }
+
+                if (!transformer_loaded_) {
+                    if (!transformer_->load_model(tts_model_path_)) {
+                        report_error("Failed to reload TTS transformer: " + transformer_->get_error());
+                        return;
+                    }
+                    transformer_loaded_ = true;
+                }
+                if (p.n_threads > 0 && !transformer_->set_n_threads(p.n_threads)) {
+                    report_error("Failed to set transformer thread count: " + transformer_->get_error());
+                    return;
+                }
+
+                if (!decoder_loaded_) {
+                    if (decoder_model_path_.empty()) {
+                        report_error("Internal error: missing vocoder model path");
+                        return;
+                    }
+                    if (!audio_decoder_->load_model(decoder_model_path_)) {
+                        report_error("Failed to load vocoder: " + audio_decoder_->get_error());
+                        return;
+                    }
+                    decoder_loaded_ = true;
+                }
+                if (p.n_threads > 0 && !audio_decoder_->set_n_threads(p.n_threads)) {
+                    report_error("Failed to set vocoder thread count: " + audio_decoder_->get_error());
+                    return;
+                }
+
+                if (!audio_decoder_->begin_stream()) {
+                    report_error("Failed to initialize decoder stream: " + audio_decoder_->get_error());
+                    return;
+                }
+
+                const int32_t n_codebooks = transformer_->get_config().n_codebooks;
+                const int32_t chunk_target_frames = std::max(1, params.stream_chunk_frames);
+                std::vector<int32_t> pending_codes;
+                pending_codes.reserve((size_t)chunk_target_frames * (size_t)n_codebooks);
+                int32_t pending_frames = 0;
+                bool any_chunk_emitted = false;
+
+                auto emit_pending = [&]() -> bool {
+                    if (pending_frames <= 0) {
+                        return true;
+                    }
+                    std::vector<float> chunk_audio;
+                    if (!audio_decoder_->decode_append(pending_codes.data(), pending_frames, chunk_audio)) {
+                        report_error("Streaming decode failed: " + audio_decoder_->get_error());
+                        return false;
+                    }
+                    pending_codes.clear();
+                    pending_frames = 0;
+
+                    if (!chunk_audio.empty()) {
+                        tts_audio_chunk chunk;
+                        chunk.audio = std::move(chunk_audio);
+                        chunk.sample_rate = audio_decoder_->get_config().sample_rate;
+                        chunk.is_last = false;
+                        if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
+                            return false;
+                        }
+                        any_chunk_emitted = true;
+                    }
+                    return true;
+                };
+
+                const float * generation_speaker_embedding = has_speaker_embedding ? speaker_embedding.data() : nullptr;
+                if (speaker_codec_id >= 0) {
+                    generation_speaker_embedding = nullptr;
+                }
+
+                std::vector<int32_t> generated_codes;
+                const bool gen_ok = transformer_->generate(
+                    text_tokens.data(),
+                    (int32_t)text_tokens.size(),
+                    generation_speaker_embedding,
+                    p.max_audio_tokens,
+                    generated_codes,
+                    effective_language_id,
+                    speaker_codec_id,
+                    p.repetition_penalty,
+                    p.temperature,
+                    p.top_k,
+                    p.top_p,
+                    instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+                    (int32_t)instruct_tokens.size(),
+                    [&](const int32_t *frame_codes, int32_t cb_count, int32_t frame_index) -> bool {
+                        if (cb_count != n_codebooks) {
+                            report_error("Unexpected codebook count in streaming callback");
+                            return false;
+                        }
+
+                        if (callbacks.on_codes_frame) {
+                            try {
+                                callbacks.on_codes_frame(frame_codes, cb_count, frame_index);
+                            } catch (...) {
+                                report_error("Streaming codes callback threw an exception");
+                                return false;
+                            }
+                        }
+
+                        pending_codes.insert(pending_codes.end(), frame_codes, frame_codes + cb_count);
+                        pending_frames++;
+
+                        if (progress_callback_) {
+                            progress_callback_(frame_index + 1, p.max_audio_tokens);
+                        }
+
+                        if (pending_frames >= chunk_target_frames) {
+                            return emit_pending();
+                        }
+
+                        return true;
+                    }
+                );
+
+                if (!gen_ok) {
+                    if (!impl->has_error) {
+                        report_error("Failed to generate speech codes: " + transformer_->get_error());
+                    }
+                    return;
+                }
+
+                if (!emit_pending()) {
+                    return;
+                }
+
+                std::vector<float> tail_samples;
+                if (!audio_decoder_->end_stream(tail_samples, params.stream_full_flush)) {
+                    report_error("Failed to finalize decoder stream: " + audio_decoder_->get_error());
+                    return;
+                }
+
+                if (!tail_samples.empty()) {
+                    tts_audio_chunk chunk;
+                    chunk.audio = std::move(tail_samples);
+                    chunk.sample_rate = audio_decoder_->get_config().sample_rate;
+                    chunk.is_last = true;
+                    if (!stream_emit_chunk(impl, std::move(chunk), callbacks)) {
+                        return;
+                    }
+                    any_chunk_emitted = true;
+                } else {
+                    tts_audio_chunk terminal;
+                    terminal.sample_rate = audio_decoder_->get_config().sample_rate;
+                    terminal.is_last = true;
+                    if (!stream_emit_chunk(impl, std::move(terminal), callbacks)) {
+                        return;
+                    }
+                }
+
+                if (callbacks.on_finish) {
+                    try {
+                        callbacks.on_finish();
+                    } catch (...) {
+                        report_error("Streaming finish callback threw an exception");
+                        return;
+                    }
+                }
+
+                if (low_mem_mode_) {
+                    transformer_->unload_model();
+                    transformer_loaded_ = false;
+                    audio_decoder_->unload_model();
+                    decoder_loaded_ = false;
+                }
+
+                (void)any_chunk_emitted;
+                stream_mark_finished(impl);
+            });
+        } catch (const std::exception &ex) {
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                stream_active_ = false;
+                stream_impl_.reset();
+            }
+            error_msg_ = std::string("Failed to start streaming worker: ") + ex.what();
+            if (callbacks.on_error) {
+                callbacks.on_error(error_msg_);
+            }
+            return nullptr;
+        }
+
+        return session;
     }
 
     static tts_result make_error_result(const std::string &error_msg) {

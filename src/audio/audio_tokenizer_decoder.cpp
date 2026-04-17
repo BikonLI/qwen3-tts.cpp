@@ -901,6 +901,84 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     return true;
 }
 
+bool AudioTokenizerDecoder::begin_stream() {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+
+    stream_state_.active = true;
+    stream_state_.total_frames = 0;
+    stream_state_.emitted_samples = 0;
+    stream_state_.all_codes.clear();
+    return true;
+}
+
+bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_frames,
+                                          std::vector<float> & out_samples) {
+    out_samples.clear();
+
+    if (!stream_state_.active) {
+        error_msg_ = "Streaming session not started";
+        return false;
+    }
+    if (!codes || n_new_frames <= 0) {
+        return true;
+    }
+
+    const int32_t n_codebooks = model_.config.n_codebooks;
+    const size_t add_count = (size_t)n_new_frames * (size_t)n_codebooks;
+    stream_state_.all_codes.insert(stream_state_.all_codes.end(), codes, codes + add_count);
+    stream_state_.total_frames += n_new_frames;
+
+    std::vector<float> all_samples;
+    if (!decode(stream_state_.all_codes.data(), stream_state_.total_frames, all_samples)) {
+        return false;
+    }
+
+    const int64_t total_samples = (int64_t)all_samples.size();
+    int64_t start = stream_state_.emitted_samples;
+    if (start < 0) {
+        start = 0;
+    }
+    if (start > total_samples) {
+        start = total_samples;
+    }
+    out_samples.assign(all_samples.begin() + start, all_samples.end());
+    stream_state_.emitted_samples = total_samples;
+    return true;
+}
+
+bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool full_flush) {
+    tail_samples.clear();
+    if (!stream_state_.active) {
+        return true;
+    }
+
+    if (full_flush && stream_state_.total_frames > 0) {
+        std::vector<float> all_samples;
+        if (!decode(stream_state_.all_codes.data(), stream_state_.total_frames, all_samples)) {
+            stream_state_.active = false;
+            return false;
+        }
+        const int64_t total_samples = (int64_t)all_samples.size();
+        int64_t start = stream_state_.emitted_samples;
+        if (start < 0) {
+            start = 0;
+        }
+        if (start > total_samples) {
+            start = total_samples;
+        }
+        tail_samples.assign(all_samples.begin() + start, all_samples.end());
+    }
+
+    stream_state_.active = false;
+    stream_state_.total_frames = 0;
+    stream_state_.emitted_samples = 0;
+    stream_state_.all_codes.clear();
+    return true;
+}
+
 void free_audio_decoder_model(audio_decoder_model & model) {
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);

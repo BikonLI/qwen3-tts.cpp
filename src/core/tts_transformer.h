@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <functional>
 #ifdef QWEN3_TTS_TIMING
 #include <chrono>
 #endif
@@ -199,6 +200,10 @@ struct tts_transformer_state {
 // TTS Transformer class
 class TTSTransformer {
 public:
+    using generate_frame_callback_t = std::function<bool(const int32_t * frame_codes,
+                                                         int32_t n_codebooks,
+                                                         int32_t frame_index)>;
+
     TTSTransformer();
     ~TTSTransformer();
     
@@ -279,7 +284,8 @@ public:
                   int32_t top_k = 50,
                   float top_p = 1.0f,
                   const int32_t * instruct_tokens = nullptr,
-                  int32_t n_instruct_tokens = 0);
+                  int32_t n_instruct_tokens = 0,
+                  const generate_frame_callback_t & on_frame = nullptr);
     
     const tts_transformer_config & get_config() const { return model_.config; }
 

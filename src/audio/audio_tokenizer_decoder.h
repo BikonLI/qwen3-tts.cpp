@@ -173,6 +173,16 @@ public:
     // Returns: audio samples normalized to [-1, 1] at 24kHz
     bool decode(const int32_t * codes, int32_t n_frames,
                 std::vector<float> & samples);
+
+    // Begin incremental decode session for streaming output.
+    bool begin_stream();
+
+    // Append new code frames and return newly produced audio samples.
+    bool decode_append(const int32_t * codes, int32_t n_new_frames,
+                       std::vector<float> & out_samples);
+
+    // End incremental decode session and flush pending samples.
+    bool end_stream(std::vector<float> & tail_samples, bool full_flush = true);
     
     const audio_decoder_config & get_config() const { return model_.config; }
 
@@ -231,6 +241,13 @@ private:
     
     // Temporary storage for codes input
     std::vector<int32_t> codes_buf_;
+
+    struct stream_state {
+        bool active = false;
+        int32_t total_frames = 0;
+        int64_t emitted_samples = 0;
+        std::vector<int32_t> all_codes;
+    } stream_state_;
 };
 
 // Free model resources

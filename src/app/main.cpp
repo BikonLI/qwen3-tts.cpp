@@ -160,9 +160,9 @@ void print_usage(const char *program) {
     fprintf(stderr, "  - else: plain synthesize\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  %s -m models/gguf/0.6b-base/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
-    fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
-    fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design/model.gguf -mt models/gguf/tokenizer/tokenizer.gguf -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/0.6b-base/qwen3-tts-12hz-0.6b-base-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" -r ref.wav --ref-text \"Hello\" -o clone.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-custom-voice/qwen3-tts-12hz-1.7b-custom-voice-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" --speaker ryan --instruct \"happy\" -o custom.wav\n", program);
+    fprintf(stderr, "  %s -m models/gguf/1.7b-voice-design/qwen3-tts-12hz-1.7b-voice-design-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t \"Hello\" --instruct \"female voice, warm tone\" -o design.wav\n", program);
 }
 
 } // namespace

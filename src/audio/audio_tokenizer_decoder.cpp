@@ -901,16 +901,65 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     return true;
 }
 
-bool AudioTokenizerDecoder::begin_stream() {
+bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
     }
 
+    const auto & cfg = model_.config;
+
+    if (left_context_frames < 0) {
+        left_context_frames = 0;
+    }
+
     stream_state_.active = true;
-    stream_state_.total_frames = 0;
+    stream_state_.left_context_frames = left_context_frames;
     stream_state_.emitted_samples = 0;
+    stream_state_.upsample_rate = 1920;
+    stream_state_.total_frames = 0;
     stream_state_.all_codes.clear();
+    stream_state_.all_codes.reserve((size_t)(left_context_frames + 16) * (size_t)cfg.n_codebooks);
+    return true;
+}
+
+bool AudioTokenizerDecoder::decode_chunk_with_context(const int32_t * chunk_codes,
+                                                      int32_t n_chunk_frames,
+                                                      int32_t n_context_frames,
+                                                      std::vector<float> & out_samples,
+                                                      bool full_output) {
+    out_samples.clear();
+
+    if (!chunk_codes || n_chunk_frames <= 0) {
+        return true;
+    }
+
+    std::vector<float> decoded;
+    if (!decode(chunk_codes, n_chunk_frames, decoded)) {
+        return false;
+    }
+
+    if (full_output || n_context_frames <= 0) {
+        out_samples = std::move(decoded);
+        return true;
+    }
+
+    if (stream_state_.upsample_rate <= 0) {
+        stream_state_.upsample_rate = 1920;
+    }
+
+    const int64_t cut = (int64_t)n_context_frames * (int64_t)stream_state_.upsample_rate;
+    if (cut <= 0) {
+        out_samples = std::move(decoded);
+        return true;
+    }
+
+    if ((size_t)cut >= decoded.size()) {
+        out_samples.clear();
+        return true;
+    }
+
+    out_samples.assign(decoded.begin() + cut, decoded.end());
     return true;
 }
 
@@ -927,25 +976,31 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
     }
 
     const int32_t n_codebooks = model_.config.n_codebooks;
-    const size_t add_count = (size_t)n_new_frames * (size_t)n_codebooks;
-    stream_state_.all_codes.insert(stream_state_.all_codes.end(), codes, codes + add_count);
-    stream_state_.total_frames += n_new_frames;
+    const int32_t processed_frames = stream_state_.total_frames;
+    const int32_t n_ctx = std::min(stream_state_.left_context_frames, processed_frames);
 
-    std::vector<float> all_samples;
-    if (!decode(stream_state_.all_codes.data(), stream_state_.total_frames, all_samples)) {
+    const int32_t n_decode_frames = n_ctx + n_new_frames;
+    std::vector<int32_t> chunk_codes((size_t)n_decode_frames * (size_t)n_codebooks);
+
+    if (n_ctx > 0) {
+        const int32_t start_ctx_frame = processed_frames - n_ctx;
+        const int32_t * src_ctx = stream_state_.all_codes.data() + (size_t)start_ctx_frame * (size_t)n_codebooks;
+        std::copy(src_ctx, src_ctx + (size_t)n_ctx * (size_t)n_codebooks, chunk_codes.begin());
+    }
+
+    std::copy(codes, codes + (size_t)n_new_frames * (size_t)n_codebooks,
+              chunk_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks);
+
+    if (!decode_chunk_with_context(chunk_codes.data(), n_decode_frames, n_ctx, out_samples, false)) {
         return false;
     }
 
-    const int64_t total_samples = (int64_t)all_samples.size();
-    int64_t start = stream_state_.emitted_samples;
-    if (start < 0) {
-        start = 0;
-    }
-    if (start > total_samples) {
-        start = total_samples;
-    }
-    out_samples.assign(all_samples.begin() + start, all_samples.end());
-    stream_state_.emitted_samples = total_samples;
+    stream_state_.all_codes.insert(stream_state_.all_codes.end(),
+                                   codes,
+                                   codes + (size_t)n_new_frames * (size_t)n_codebooks);
+    stream_state_.total_frames += n_new_frames;
+    stream_state_.emitted_samples += (int64_t)out_samples.size();
+
     return true;
 }
 
@@ -956,25 +1011,35 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
     }
 
     if (full_flush && stream_state_.total_frames > 0) {
-        std::vector<float> all_samples;
-        if (!decode(stream_state_.all_codes.data(), stream_state_.total_frames, all_samples)) {
+        const int32_t n_codebooks = model_.config.n_codebooks;
+        if ((size_t)stream_state_.total_frames * (size_t)n_codebooks > stream_state_.all_codes.size()) {
+            stream_state_.active = false;
+            error_msg_ = "Internal stream state is inconsistent";
+            return false;
+        }
+
+        std::vector<int32_t> final_codes((size_t)stream_state_.total_frames * (size_t)n_codebooks);
+        std::copy(stream_state_.all_codes.end() - (ptrdiff_t)final_codes.size(),
+                  stream_state_.all_codes.end(),
+                  final_codes.begin());
+
+        if (!decode_chunk_with_context(final_codes.data(), stream_state_.total_frames, 0, tail_samples, true)) {
             stream_state_.active = false;
             return false;
         }
-        const int64_t total_samples = (int64_t)all_samples.size();
-        int64_t start = stream_state_.emitted_samples;
-        if (start < 0) {
-            start = 0;
+
+        if (stream_state_.emitted_samples > 0 && (size_t)stream_state_.emitted_samples < tail_samples.size()) {
+            tail_samples.erase(tail_samples.begin(), tail_samples.begin() + stream_state_.emitted_samples);
+        } else {
+            tail_samples.clear();
         }
-        if (start > total_samples) {
-            start = total_samples;
-        }
-        tail_samples.assign(all_samples.begin() + start, all_samples.end());
     }
 
     stream_state_.active = false;
-    stream_state_.total_frames = 0;
+    stream_state_.left_context_frames = 25;
     stream_state_.emitted_samples = 0;
+    stream_state_.upsample_rate = 1;
+    stream_state_.total_frames = 0;
     stream_state_.all_codes.clear();
     return true;
 }

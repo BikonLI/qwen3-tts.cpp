@@ -1410,7 +1410,7 @@ namespace qwen3_tts {
                     return;
                 }
 
-                if (!audio_decoder_->begin_stream()) {
+                if (!audio_decoder_->begin_stream(params.stream_decoder_left_context_frames)) {
                     report_error("Failed to initialize decoder stream: " + audio_decoder_->get_error());
                     return;
                 }

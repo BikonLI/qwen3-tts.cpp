@@ -175,7 +175,7 @@ public:
                 std::vector<float> & samples);
 
     // Begin incremental decode session for streaming output.
-    bool begin_stream();
+    bool begin_stream(int32_t left_context_frames = 25);
 
     // Append new code frames and return newly produced audio samples.
     bool decode_append(const int32_t * codes, int32_t n_new_frames,
@@ -244,10 +244,18 @@ private:
 
     struct stream_state {
         bool active = false;
-        int32_t total_frames = 0;
+        int32_t left_context_frames = 25;
         int64_t emitted_samples = 0;
+        int32_t upsample_rate = 1;
+        int32_t total_frames = 0;
         std::vector<int32_t> all_codes;
     } stream_state_;
+
+    bool decode_chunk_with_context(const int32_t * chunk_codes,
+                                   int32_t n_chunk_frames,
+                                   int32_t n_context_frames,
+                                   std::vector<float> & out_samples,
+                                   bool full_output);
 };
 
 // Free model resources

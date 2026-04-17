@@ -475,6 +475,7 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --stream                          Enable streaming generation/playback\n");
     fprintf(stderr, "  --stream-save <wav>               Save streamed audio while playing\n");
     fprintf(stderr, "  --stream-chunk-frames <n>         Frames per streamed chunk (default: 4)\n");
+    fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 25)\n");
     fprintf(stderr, "  --stream-queue-cap <n>            Stream queue capacity (default: 8)\n");
     fprintf(stderr, "  --stream-poll-timeout <ms>        Poll timeout for stream client (default: 100)\n");
     fprintf(stderr, "  -j, --threads <n>                 Number of threads\n");
@@ -510,6 +511,7 @@ int main(int argc, char **argv) {
     int32_t stream_chunk_frames = 4;
     int32_t stream_queue_cap = 8;
     int32_t stream_poll_timeout = 100;
+    int32_t stream_decoder_left_context = 25;
 
     qwen3_tts::tts_params params;
 
@@ -636,6 +638,12 @@ int main(int argc, char **argv) {
                 return 1;
             }
             stream_poll_timeout = std::max(0, std::stoi(argv[i]));
+        } else if (arg == "--stream-left-context") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-left-context value\n");
+                return 1;
+            }
+            stream_decoder_left_context = std::max(0, std::stoi(argv[i]));
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --threads value\n");
@@ -705,6 +713,7 @@ int main(int argc, char **argv) {
         stream_params.stream_queue_capacity = stream_queue_cap;
         stream_params.stream_poll_timeout_ms = stream_poll_timeout;
         stream_params.stream_full_flush = true;
+        stream_params.stream_decoder_left_context_frames = stream_decoder_left_context;
 
         std::shared_ptr<qwen3_tts::tts_stream_session> session;
         if (!reference_audio.empty()) {

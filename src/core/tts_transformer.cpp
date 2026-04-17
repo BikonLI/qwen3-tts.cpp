@@ -156,6 +156,29 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     return true;
 }
 
+bool TTSTransformer::set_n_threads(int32_t n_threads) {
+    if (n_threads <= 0) {
+        return true;
+    }
+
+    if (!state_.backend) {
+        error_msg_ = "Backend not initialized";
+        return false;
+    }
+
+    if (!set_backend_n_threads(state_.backend, n_threads)) {
+        error_msg_ = "Backend does not support thread configuration";
+        return false;
+    }
+
+    if (state_.backend_cpu && !set_backend_n_threads(state_.backend_cpu, n_threads)) {
+        error_msg_ = "CPU fallback backend does not support thread configuration";
+        return false;
+    }
+
+    return true;
+}
+
 bool TTSTransformer::try_init_coreml_code_predictor(const std::string & model_path) {
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();

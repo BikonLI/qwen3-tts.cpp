@@ -76,6 +76,36 @@ void release_preferred_backend(ggml_backend_t backend) {
     ggml_backend_free(backend);
 }
 
+bool set_backend_n_threads(ggml_backend_t backend, int32_t n_threads) {
+    if (!backend) {
+        return false;
+    }
+    if (n_threads <= 0) {
+        return true;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return false;
+    }
+
+    auto set_threads = (ggml_backend_set_n_threads_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+    if (!set_threads) {
+        // Some non-CPU backends do not expose thread controls. Treat this as
+        // a no-op for those devices while still requiring CPU support.
+        return ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    }
+
+    set_threads(backend, n_threads);
+    return true;
+}
+
 bool GGUFLoader::open(const std::string & path) {
     close();  // Close any previously opened file
     

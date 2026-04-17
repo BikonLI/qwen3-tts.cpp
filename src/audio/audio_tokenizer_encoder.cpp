@@ -288,6 +288,29 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
     return true;
 }
 
+bool AudioTokenizerEncoder::set_n_threads(int32_t n_threads) {
+    if (n_threads <= 0) {
+        return true;
+    }
+
+    if (!state_.backend) {
+        error_msg_ = "Backend not initialized";
+        return false;
+    }
+
+    if (!set_backend_n_threads(state_.backend, n_threads)) {
+        error_msg_ = "Backend does not support thread configuration";
+        return false;
+    }
+
+    if (state_.backend_cpu && !set_backend_n_threads(state_.backend_cpu, n_threads)) {
+        error_msg_ = "CPU fallback backend does not support thread configuration";
+        return false;
+    }
+
+    return true;
+}
+
 bool AudioTokenizerEncoder::compute_mel_spectrogram(const float * samples, int32_t n_samples,
                                                      std::vector<float> & mel, int32_t & n_frames) {
     const auto & cfg = model_.config;

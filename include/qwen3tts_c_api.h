@@ -43,6 +43,8 @@ void qwen3_tts_default_params(Qwen3TtsParams* params);
 /* Create TTS engine and load models from directory.
  * model_dir must contain one TTS gguf (0.6B/1.7B, Base/CustomVoice/VoiceDesign)
  * and one tokenizer gguf.
+ * n_threads sets the default thread count used when synthesis params are NULL
+ * or when params->n_threads <= 0.
  * Returns NULL on failure. */
 Qwen3Tts* qwen3_tts_create(const char* model_dir, int32_t n_threads);
 

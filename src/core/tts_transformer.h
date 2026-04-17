@@ -282,6 +282,10 @@ public:
                   int32_t n_instruct_tokens = 0);
     
     const tts_transformer_config & get_config() const { return model_.config; }
+
+    // Configure backend thread count when supported by selected backend.
+    // n_threads <= 0 keeps backend defaults.
+    bool set_n_threads(int32_t n_threads);
     
     const std::string & get_error() const { return error_msg_; }
     

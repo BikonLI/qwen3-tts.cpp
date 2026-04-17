@@ -372,6 +372,29 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     return true;
 }
 
+bool AudioTokenizerDecoder::set_n_threads(int32_t n_threads) {
+    if (n_threads <= 0) {
+        return true;
+    }
+
+    if (!state_.backend) {
+        error_msg_ = "Backend not initialized";
+        return false;
+    }
+
+    if (!set_backend_n_threads(state_.backend, n_threads)) {
+        error_msg_ = "Backend does not support thread configuration";
+        return false;
+    }
+
+    if (state_.backend_cpu && !set_backend_n_threads(state_.backend_cpu, n_threads)) {
+        error_msg_ = "CPU fallback backend does not support thread configuration";
+        return false;
+    }
+
+    return true;
+}
+
 struct ggml_tensor * AudioTokenizerDecoder::apply_snake(struct ggml_context * ctx,
                                                          struct ggml_tensor * x,
                                                          struct ggml_tensor * alpha,

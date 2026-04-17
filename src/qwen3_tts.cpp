@@ -526,6 +526,11 @@ namespace qwen3_tts {
             }
         }
 
+        if (params.n_threads > 0 && !audio_encoder_->set_n_threads(params.n_threads)) {
+            result.error_msg = "Failed to set speaker encoder thread count: " + audio_encoder_->get_error();
+            return result;
+        }
+
         int64_t t_encode_start = get_time_ms();
         std::vector<float> speaker_embedding;
 
@@ -567,6 +572,11 @@ namespace qwen3_tts {
                     (long long)(get_time_ms() - t_encoder_load_start)
                 );
             }
+        }
+
+        if (params.n_threads > 0 && !audio_encoder_->set_n_threads(params.n_threads)) {
+            error_msg_ = "Failed to set speaker encoder thread count: " + audio_encoder_->get_error();
+            return false;
         }
 
         if (!audio_encoder_->encode(ref_samples, n_ref_samples, embedding)) {
@@ -739,10 +749,17 @@ namespace qwen3_tts {
                 return result;
             }
             transformer_loaded_ = true;
+            if (params.n_threads > 0 && !transformer_->set_n_threads(params.n_threads)) {
+                result.error_msg = "Failed to set transformer thread count: " + transformer_->get_error();
+                return result;
+            }
             if (params.print_timing) {
                 fprintf(stderr, "  Transformer reloaded in %lld ms\n", (long long)(get_time_ms() - t_reload_start));
                 sample_memory("synth/after-transformer-reload");
             }
+        } else if (params.n_threads > 0 && !transformer_->set_n_threads(params.n_threads)) {
+            result.error_msg = "Failed to set transformer thread count: " + transformer_->get_error();
+            return result;
         }
         transformer_->clear_kv_cache();
 
@@ -764,6 +781,7 @@ namespace qwen3_tts {
             result.error_msg = "Failed to generate speech codes: " + transformer_->get_error();
             return result;
         }
+
         result.t_generate_ms = get_time_ms() - t_generate_start;
         sample_memory("synth/after-generate");
 
@@ -798,12 +816,19 @@ namespace qwen3_tts {
                 return result;
             }
             decoder_loaded_ = true;
+            if (params.n_threads > 0 && !audio_decoder_->set_n_threads(params.n_threads)) {
+                result.error_msg = "Failed to set vocoder thread count: " + audio_decoder_->get_error();
+                return result;
+            }
             if (params.print_timing) {
                 fprintf(
                     stderr, "  Vocoder lazy-loaded in %lld ms\n", (long long)(get_time_ms() - t_decoder_load_start)
                 );
                 sample_memory("synth/after-vocoder-load");
             }
+        } else if (params.n_threads > 0 && !audio_decoder_->set_n_threads(params.n_threads)) {
+            result.error_msg = "Failed to set vocoder thread count: " + audio_decoder_->get_error();
+            return result;
         }
 
         if (!audio_decoder_->decode(speech_codes.data(), n_frames, result.audio)) {

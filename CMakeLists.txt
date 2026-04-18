@@ -97,6 +97,9 @@ if(APPLE AND QWEN3_TTS_COREML)
         "-framework CoreML"
     )
 endif()
+if(WIN32)
+    target_link_libraries(qwen3tts_shared PUBLIC Psapi)
+endif()
 
 # CLI executable
 add_executable(qwen3-tts-cli

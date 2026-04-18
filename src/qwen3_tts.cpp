@@ -22,6 +22,15 @@
 #include <mach/mach.h>
 #elif defined(__linux__)
 #include <sys/resource.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
 #else
 #endif
 
@@ -262,6 +271,18 @@ namespace qwen3_tts {
         }
         out.rss_bytes = (uint64_t)usage.ru_maxrss * 1024ULL;
         out.phys_footprint_bytes = out.rss_bytes;
+        return true;
+#elif defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS_EX pmc = {};
+        if (!GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc),
+                (DWORD)sizeof(pmc)
+            )) {
+            return false;
+        }
+        out.rss_bytes = (uint64_t)pmc.WorkingSetSize;
+        out.phys_footprint_bytes = pmc.PrivateUsage > 0 ? (uint64_t)pmc.PrivateUsage : out.rss_bytes;
         return true;
 #else
         return false;

@@ -140,10 +140,10 @@ void print_usage(const char *program) {
     fprintf(stderr, "Optional:\n");
     fprintf(stderr, "  -o, --output <wav>                Output WAV file; omit to play audio\n");
     fprintf(stderr, "  -r, --reference <wav>             Reference audio for voice clone\n");
-    fprintf(stderr, "  --ref-text <text>                 Reference transcript for voice clone\n");
+    fprintf(stderr, "  --ref-text <text|file>            Reference transcript for voice clone\n");
     fprintf(stderr, "  --x-vector-only                   Voice clone without reference_text\n");
     fprintf(stderr, "  --speaker <name>                  CustomVoice speaker\n");
-    fprintf(stderr, "  --instruct <text>                 Instruct text (CustomVoice/VoiceDesign)\n");
+    fprintf(stderr, "  --instruct <text|file>            Instruct text (CustomVoice/VoiceDesign)\n");
     fprintf(stderr, "  -l, --language <lang>             auto,en,ru,zh,ja,ko,de,fr,es,it,pt,beijing_dialect,sichuan_dialect\n");
     fprintf(stderr, "  --temperature <v>                 Sampling temperature (default: 0.9)\n");
     fprintf(stderr, "  --top-k <n>                       Top-k (default: 50)\n");
@@ -308,6 +308,16 @@ int main(int argc, char **argv) {
 
     if (!load_text_or_file(text_input, text) || text.empty()) {
         fprintf(stderr, "Error: failed to load text from --text argument\n");
+        return 1;
+    }
+
+    if (!reference_text.empty() && !load_text_or_file(reference_text, reference_text)) {
+        fprintf(stderr, "Error: failed to load text from --ref-text argument\n");
+        return 1;
+    }
+
+    if (!instruct.empty() && !load_text_or_file(instruct, instruct)) {
+        fprintf(stderr, "Error: failed to load text from --instruct argument\n");
         return 1;
     }
 

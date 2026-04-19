@@ -285,7 +285,8 @@ public:
                   float top_p = 1.0f,
                   const int32_t * instruct_tokens = nullptr,
                   int32_t n_instruct_tokens = 0,
-                  const generate_frame_callback_t & on_frame = nullptr);
+                  const generate_frame_callback_t & on_frame = nullptr,
+                  int32_t seed = -1);
     
     const tts_transformer_config & get_config() const { return model_.config; }
 

@@ -986,7 +986,9 @@ namespace qwen3_tts {
             params.repetition_penalty, params.temperature, params.top_k,
                 params.top_p,
                 instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
-                (int32_t)instruct_tokens.size()
+                (int32_t)instruct_tokens.size(),
+                nullptr,
+                params.seed
             )) {
             result.error_msg = "Failed to generate speech codes: " + transformer_->get_error();
             return result;
@@ -1418,7 +1420,7 @@ namespace qwen3_tts {
                     return;
                 }
                 const int32_t stream_talker_window =
-                    params.stream_talker_attention_window > 0
+                    params.stream_talker_attention_window >= 0
                         ? params.stream_talker_attention_window
                         : p.talker_attention_window;
                 transformer_->set_talker_attention_window(stream_talker_window);
@@ -1439,28 +1441,25 @@ namespace qwen3_tts {
                     return;
                 }
 
-                if (!audio_decoder_->begin_stream(params.stream_decoder_left_context_frames)) {
+                if (!audio_decoder_->begin_stream(
+                        params.stream_decoder_left_context_frames,
+                        params.stream_decoder_lookahead_frames)) {
                     report_error("Failed to initialize decoder stream: " + audio_decoder_->get_error());
                     return;
                 }
 
                 const int32_t n_codebooks = transformer_->get_config().n_codebooks;
-                int32_t chunk_target_frames = std::max(1, params.stream_chunk_frames);
-                int32_t left_context_frames = std::max(0, params.stream_decoder_left_context_frames);
-                const int32_t chunk_target_base = chunk_target_frames;
-                const int32_t left_context_base = left_context_frames;
-                std::atomic<int32_t> chunk_target_shared{chunk_target_frames};
+                const int32_t chunk_target_frames = std::max(1, params.stream_chunk_frames);
+                const int32_t left_context_frames = std::max(0, params.stream_decoder_left_context_frames);
+                const int32_t lookahead_frames = std::max(0, params.stream_decoder_lookahead_frames);
                 std::vector<int32_t> pending_codes;
                 pending_codes.reserve((size_t)chunk_target_frames * (size_t)n_codebooks);
                 int32_t pending_frames = 0;
                 bool any_chunk_emitted = false;
                 const bool stream_dbg = stream_debug_enabled();
-                const bool adaptive_enabled = params.stream_adaptive_tuning;
-                const int32_t adaptive_chunk_min = std::max(1, params.stream_chunk_frames_min);
-                const int32_t adaptive_chunk_max = std::max(adaptive_chunk_min, params.stream_chunk_frames_max);
-                const int32_t adaptive_ctx_min = std::max(0, params.stream_left_context_frames_min);
-                const float adaptive_high = std::max(0.10f, params.stream_adaptive_high_ratio);
-                const float adaptive_low = std::max(0.05f, std::min(params.stream_adaptive_low_ratio, adaptive_high));
+                if (params.stream_adaptive_tuning) {
+                    fprintf(stderr, "[stream] adaptive tuning is disabled; using fixed chunk/context\n");
+                }
                 int64_t stream_t0_ms = get_time_ms();
                 int64_t t_tok_ms = 0;
                 int64_t t_gen_cb_ms = 0;
@@ -1469,11 +1468,20 @@ namespace qwen3_tts {
                 int32_t n_decode_calls = 0;
                 int32_t n_emit_calls = 0;
                 int32_t n_frames_seen = 0;
+                int64_t t_enqueue_wait_ms = 0;
+                int32_t n_enqueue_waits = 0;
+                std::atomic<int32_t> decode_queue_peak{0};
+                std::atomic<int32_t> output_queue_peak{0};
+
+                auto update_peak = [](std::atomic<int32_t> &peak, int32_t value) {
+                    int32_t cur = peak.load();
+                    while (value > cur && !peak.compare_exchange_weak(cur, value)) {
+                    }
+                };
 
                 struct decode_work_item {
                     std::vector<int32_t> codes;
                     int32_t n_frames = 0;
-                    bool allow_adaptive_tuning = false;
                 };
                 std::mutex decode_mutex;
                 std::condition_variable decode_cv;
@@ -1501,9 +1509,10 @@ namespace qwen3_tts {
                 };
 
                 dbg_log(
-                    "start chunk_frames=%d left_ctx=%d max_tokens=%d",
+                    "start chunk_frames=%d left_ctx=%d lookahead=%d max_tokens=%d",
                     chunk_target_frames,
                     left_context_frames,
+                    lookahead_frames,
                     p.max_audio_tokens
                 );
 
@@ -1522,12 +1531,6 @@ namespace qwen3_tts {
                 };
 
                 std::thread decode_worker([&]() {
-                    double adaptive_ratio_ema = -1.0;
-                    int32_t adaptive_slow_streak = 0;
-                    int32_t adaptive_fast_streak = 0;
-                    int32_t adaptive_cooldown = 0;
-                    int32_t local_left_context_frames = left_context_frames;
-
                     while (true) {
                         decode_work_item work;
                         {
@@ -1563,87 +1566,8 @@ namespace qwen3_tts {
                         t_decode_ms += (t1_ms - t0_ms);
                         n_decode_calls++;
 
-                        const int32_t sr = audio_decoder_->get_config().sample_rate;
-                        if (adaptive_enabled && work.allow_adaptive_tuning && sr > 0 && work.n_frames > 0) {
-                            const double audio_ms = (double)work.n_frames * 1920.0 * 1000.0 / (double)sr;
-                            if (audio_ms >= 120.0) {
-                                const double ratio_raw = audio_ms > 0.0 ? (double)(t1_ms - t0_ms) / audio_ms : 0.0;
-                                adaptive_ratio_ema = (adaptive_ratio_ema < 0.0)
-                                    ? ratio_raw
-                                    : (adaptive_ratio_ema * 0.70 + ratio_raw * 0.30);
-
-                                if (adaptive_cooldown > 0) {
-                                    adaptive_cooldown--;
-                                }
-
-                                if (adaptive_ratio_ema > adaptive_high) {
-                                    adaptive_slow_streak++;
-                                    adaptive_fast_streak = 0;
-                                } else if (adaptive_ratio_ema < adaptive_low) {
-                                    adaptive_fast_streak++;
-                                    adaptive_slow_streak = 0;
-                                } else {
-                                    adaptive_slow_streak = 0;
-                                    adaptive_fast_streak = 0;
-                                }
-
-                                bool tuned = false;
-                                if (adaptive_cooldown == 0 && adaptive_slow_streak >= 1) {
-                                    const int32_t chunk_step = adaptive_ratio_ema > (double)adaptive_high * 1.35 ? 2 : 1;
-                                    int32_t chunk_cur = chunk_target_shared.load();
-                                    if (chunk_cur < adaptive_chunk_max) {
-                                        chunk_cur = std::min(adaptive_chunk_max, chunk_cur + chunk_step);
-                                        chunk_target_shared.store(chunk_cur);
-                                        tuned = true;
-                                    }
-                                    if (local_left_context_frames > adaptive_ctx_min) {
-                                        local_left_context_frames = std::max(adaptive_ctx_min, local_left_context_frames - 1);
-                                        if (!audio_decoder_->set_stream_left_context(local_left_context_frames)) {
-                                            set_decode_error("Failed to tune stream left context: " + audio_decoder_->get_error());
-                                            return;
-                                        }
-                                        tuned = true;
-                                    }
-                                    adaptive_slow_streak = 0;
-                                    if (tuned) {
-                                        adaptive_cooldown = 2;
-                                    }
-                                } else if (adaptive_cooldown == 0 && adaptive_fast_streak >= 2) {
-                                    int32_t chunk_cur = chunk_target_shared.load();
-                                    if (local_left_context_frames < left_context_base) {
-                                        local_left_context_frames = std::min(left_context_base, local_left_context_frames + 1);
-                                        if (!audio_decoder_->set_stream_left_context(local_left_context_frames)) {
-                                            set_decode_error("Failed to tune stream left context: " + audio_decoder_->get_error());
-                                            return;
-                                        }
-                                        tuned = true;
-                                    }
-                                    if (chunk_cur > chunk_target_base) {
-                                        chunk_cur = std::max(chunk_target_base, chunk_cur - 1);
-                                        chunk_target_shared.store(chunk_cur);
-                                        tuned = true;
-                                    }
-                                    adaptive_fast_streak = 0;
-                                    if (tuned) {
-                                        adaptive_cooldown = 3;
-                                    }
-                                }
-
-                                if (tuned) {
-                                    dbg_log(
-                                        "adaptive ratio_raw=%.3f ratio_ema=%.3f chunk=%d ctx=%d decode_ms=%lld audio_ms=%.1f",
-                                        ratio_raw,
-                                        adaptive_ratio_ema,
-                                        chunk_target_shared.load(),
-                                        local_left_context_frames,
-                                        (long long)(t1_ms - t0_ms),
-                                        audio_ms
-                                    );
-                                }
-                            }
-                        }
-
                         const int32_t out_samples_count = (int32_t)chunk_audio.size();
+
                         if (!chunk_audio.empty()) {
                             tts_audio_chunk chunk;
                             chunk.audio = std::move(chunk_audio);
@@ -1674,6 +1598,7 @@ namespace qwen3_tts {
                             std::lock_guard<std::mutex> lock(impl->mutex);
                             queue_size = (int32_t)impl->queue.size();
                         }
+                        update_peak(output_queue_peak, queue_size);
 
                         dbg_log(
                             "emit decode_call=%d decode_ms=%lld emit_calls=%d out_samples=%d queue=%d",
@@ -1756,15 +1681,21 @@ namespace qwen3_tts {
                     }
                 } decode_guard{decode_mutex, decode_cv, decode_input_done, decode_worker};
 
-                auto enqueue_decode = [&](std::vector<int32_t> &&codes, int32_t n_frames, bool allow_adaptive_tuning) -> bool {
+                auto enqueue_decode = [&](std::vector<int32_t> &&codes, int32_t n_frames) -> bool {
                     if (n_frames <= 0 || codes.empty()) {
                         return true;
                     }
 
                     std::unique_lock<std::mutex> lock(decode_mutex);
+                    const int64_t t_wait0_ms = get_time_ms();
                     decode_cv.wait(lock, [&]() {
                         return decode_queue.size() < decode_work_capacity || decode_failed.load();
                     });
+                    const int64_t t_wait1_ms = get_time_ms();
+                    if (t_wait1_ms > t_wait0_ms) {
+                        t_enqueue_wait_ms += (t_wait1_ms - t_wait0_ms);
+                        n_enqueue_waits++;
+                    }
                     if (decode_failed.load()) {
                         return false;
                     }
@@ -1772,8 +1703,8 @@ namespace qwen3_tts {
                     decode_work_item item;
                     item.codes = std::move(codes);
                     item.n_frames = n_frames;
-                    item.allow_adaptive_tuning = allow_adaptive_tuning;
                     decode_queue.push_back(std::move(item));
+                    update_peak(decode_queue_peak, (int32_t)decode_queue.size());
                     lock.unlock();
                     decode_cv.notify_all();
                     return true;
@@ -1788,7 +1719,7 @@ namespace qwen3_tts {
                     return false;
                 };
 
-                auto emit_pending = [&](bool allow_adaptive_tuning) -> bool {
+                auto emit_pending = [&]() -> bool {
                     if (pending_frames <= 0) {
                         return true;
                     }
@@ -1797,10 +1728,10 @@ namespace qwen3_tts {
                     const int32_t chunk_frames = pending_frames;
                     pending_codes.clear();
                     pending_frames = 0;
-                    const int32_t reserve_frames = std::max(1, chunk_target_shared.load());
+                    const int32_t reserve_frames = std::max(1, chunk_target_frames);
                     pending_codes.reserve((size_t)reserve_frames * (size_t)n_codebooks);
 
-                    if (!enqueue_decode(std::move(chunk_codes), chunk_frames, allow_adaptive_tuning)) {
+                    if (!enqueue_decode(std::move(chunk_codes), chunk_frames)) {
                         return fail_from_decode_worker();
                     }
                     return true;
@@ -1855,9 +1786,9 @@ namespace qwen3_tts {
                             progress_callback_(frame_index + 1, p.max_audio_tokens);
                         }
 
-                        const int32_t chunk_target_now = std::max(1, chunk_target_shared.load());
+                        const int32_t chunk_target_now = std::max(1, chunk_target_frames);
                         if (pending_frames >= chunk_target_now) {
-                            bool ok = emit_pending(true);
+                            bool ok = emit_pending();
                             t_gen_cb_ms += (get_time_ms() - cb_t0_ms);
                             return ok;
                         }
@@ -1865,7 +1796,8 @@ namespace qwen3_tts {
                         t_gen_cb_ms += (get_time_ms() - cb_t0_ms);
 
                         return true;
-                    }
+                    },
+                    p.seed
                 );
 
                 if (!gen_ok) {
@@ -1875,7 +1807,7 @@ namespace qwen3_tts {
                     return;
                 }
 
-                if (!emit_pending(false)) {
+                if (!emit_pending()) {
                     return;
                 }
 
@@ -1912,17 +1844,26 @@ namespace qwen3_tts {
                 (void)any_chunk_emitted;
                 if (stream_dbg) {
                     int64_t t_total_ms = get_time_ms() - stream_t0_ms;
+                    int32_t queue_final = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(impl->mutex);
+                        queue_final = (int32_t)impl->queue.size();
+                    }
                     dbg_log(
-                        "done total_ms=%lld tokenize_ms=%lld gen_cb_ms=%lld decode_ms=%lld emit_ms=%lld frames=%d decode_calls=%d emit_calls=%d queue_final=%d",
+                        "done total_ms=%lld tokenize_ms=%lld gen_cb_ms=%lld decode_ms=%lld emit_ms=%lld enqueue_wait_ms=%lld enqueue_waits=%d frames=%d decode_calls=%d emit_calls=%d decode_q_peak=%d out_q_peak=%d queue_final=%d",
                         (long long)t_total_ms,
                         (long long)t_tok_ms,
                         (long long)t_gen_cb_ms,
                         (long long)t_decode_ms,
                         (long long)t_emit_ms,
+                        (long long)t_enqueue_wait_ms,
+                        n_enqueue_waits,
                         n_frames_seen,
                         n_decode_calls,
                         n_emit_calls,
-                        (int)impl->queue.size()
+                        decode_queue_peak.load(),
+                        output_queue_peak.load(),
+                        queue_final
                     );
                 }
                 stream_mark_finished(impl);
@@ -2427,6 +2368,7 @@ namespace qwen3_tts {
         out.print_progress = params.print_progress;
         out.print_timing = params.print_timing;
         out.repetition_penalty = params.repetition_penalty;
+        out.seed = params.seed;
         out.language_id = params.language_id;
         out.talker_attention_window = params.talker_attention_window;
         return out;

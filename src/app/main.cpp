@@ -313,6 +313,13 @@ public:
         return true;
     }
 
+    int queued_bytes() const {
+        if (!stream_) {
+            return 0;
+        }
+        return SDL_GetAudioStreamQueued(stream_);
+    }
+
     bool finish(std::string &error_msg) {
         if (!stream_) {
             return true;
@@ -395,6 +402,11 @@ static bool run_stream_session(
     int64_t n_poll_timeouts = 0;
     int64_t n_chunks = 0;
     int64_t total_chunk_samples = 0;
+    int64_t player_q_peak_bytes = 0;
+    int64_t player_q_last_bytes = 0;
+    int64_t player_q_probe_errors = 0;
+    int64_t player_underrun_events = 0;
+    bool player_prev_empty = false;
     auto t_stream_start = std::chrono::steady_clock::now();
 
     StreamPlayer player;
@@ -412,6 +424,20 @@ static bool run_stream_session(
 
         if (status == qwen3_tts::tts_stream_poll_status::timeout) {
             n_poll_timeouts++;
+            if (playback_enabled && player_opened) {
+                const int queued_bytes = player.queued_bytes();
+                if (queued_bytes >= 0) {
+                    player_q_last_bytes = queued_bytes;
+                    player_q_peak_bytes = std::max<int64_t>(player_q_peak_bytes, queued_bytes);
+                    const bool now_empty = queued_bytes == 0;
+                    if (now_empty && !player_prev_empty) {
+                        player_underrun_events++;
+                    }
+                    player_prev_empty = now_empty;
+                } else {
+                    player_q_probe_errors++;
+                }
+            }
             continue;
         }
 
@@ -455,6 +481,15 @@ static bool run_stream_session(
                     }
                     auto t_push1 = std::chrono::steady_clock::now();
                     push_ms += std::chrono::duration_cast<std::chrono::milliseconds>(t_push1 - t_push0).count();
+
+                    const int queued_bytes = player.queued_bytes();
+                    if (queued_bytes >= 0) {
+                        player_q_last_bytes = queued_bytes;
+                        player_q_peak_bytes = std::max<int64_t>(player_q_peak_bytes, queued_bytes);
+                        player_prev_empty = queued_bytes == 0;
+                    } else {
+                        player_q_probe_errors++;
+                    }
                 }
 
                 auto t_wav0 = std::chrono::steady_clock::now();
@@ -474,13 +509,17 @@ static bool run_stream_session(
                 const double chunk_ms = stats.sample_rate > 0
                     ? ((double)chunk.audio.size() * 1000.0 / (double)stats.sample_rate)
                     : 0.0;
+                const double player_q_ms = (playback_enabled && stats.sample_rate > 0)
+                    ? ((double)(player_q_last_bytes / (int64_t)sizeof(float)) * 1000.0 / (double)stats.sample_rate)
+                    : 0.0;
                 fprintf(
                     stderr,
-                    "[stream-cli] chunk=%lld samples=%zu dur_ms=%.1f dropped_before=%d\n",
+                    "[stream-cli] chunk=%lld samples=%zu dur_ms=%.1f dropped_before=%d player_q_ms=%.1f\n",
                     (long long)chunk.chunk_id,
                     chunk.audio.size(),
                     chunk_ms,
-                    chunk.dropped_before
+                    chunk.dropped_before,
+                    player_q_ms
                 );
             }
             continue;
@@ -506,9 +545,12 @@ static bool run_stream_session(
         if (n_chunks > 0 && stats.sample_rate > 0) {
             avg_chunk_ms = ((double)total_chunk_samples * 1000.0 / (double)stats.sample_rate) / (double)n_chunks;
         }
+        const double player_q_peak_ms = (playback_enabled && stats.sample_rate > 0)
+            ? ((double)(player_q_peak_bytes / (int64_t)sizeof(float)) * 1000.0 / (double)stats.sample_rate)
+            : 0.0;
         fprintf(
             stderr,
-            "[stream-cli] done total_ms=%lld polls=%lld poll_ms=%lld timeouts=%lld chunks=%lld avg_chunk_audio_ms=%.1f push_ms=%lld wav_ms=%lld dropped=%d\n",
+            "[stream-cli] done total_ms=%lld polls=%lld poll_ms=%lld timeouts=%lld chunks=%lld avg_chunk_audio_ms=%.1f push_ms=%lld wav_ms=%lld player_q_peak_ms=%.1f player_q_probe_errors=%lld dropped=%d\n",
             (long long)total_ms,
             (long long)n_polls,
             (long long)poll_ms,
@@ -517,8 +559,17 @@ static bool run_stream_session(
             avg_chunk_ms,
             (long long)push_ms,
             (long long)wav_ms,
+            player_q_peak_ms,
+            (long long)player_q_probe_errors,
             stats.dropped_chunks
         );
+        if (playback_enabled) {
+            fprintf(
+                stderr,
+                "[stream-cli] playback underrun_events=%lld\n",
+                (long long)player_underrun_events
+            );
+        }
     }
 
     return true;
@@ -545,13 +596,15 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --top-p <v>                       Top-p (default: 1.0)\n");
     fprintf(stderr, "  --max-tokens <n>                  Max audio tokens (default: 4096)\n");
     fprintf(stderr, "  --repetition-penalty <v>          Repetition penalty (default: 1.05)\n");
+    fprintf(stderr, "  --seed <n>                        Sampling seed (-1 = random, default: -1)\n");
     fprintf(stderr, "  --stream                          Enable streaming generation/playback\n");
-    fprintf(stderr, "  --stream-realtime                 Enable strict realtime preset (RTF-first)\n");
+    fprintf(stderr, "  --stream-realtime                 Enable realtime preset (RTF-first, safe sampling)\n");
     fprintf(stderr, "  --stream-no-playback              Disable playback (benchmark mode)\n");
     fprintf(stderr, "  --stream-playback                 Enable playback (default)\n");
-    fprintf(stderr, "  --stream-chunk-frames <n>         Frames per streamed chunk (default: 4)\n");
-    fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 4)\n");
-    fprintf(stderr, "  --stream-talker-window <n>        Talker attention window for stream (default: 512)\n");
+    fprintf(stderr, "  --stream-chunk-frames <n>         Frames per streamed chunk (default: 12)\n");
+    fprintf(stderr, "  --stream-left-context <n>         Decoder left context frames (default: 2)\n");
+    fprintf(stderr, "  --stream-lookahead <n>            Decoder right lookahead frames (default: 4)\n");
+    fprintf(stderr, "  --stream-talker-window <n>        Talker attention window for stream (default: 0=full)\n");
     fprintf(stderr, "  --talker-window <n>               Talker attention window for non-stream (default: 0=full)\n");
     fprintf(stderr, "  --stream-parallel-decode          Decode in parallel worker (default: on)\n");
     fprintf(stderr, "  --stream-no-parallel-decode       Disable parallel decode worker\n");
@@ -595,18 +648,35 @@ int main(int argc, char **argv) {
     std::string speaker;
     std::string instruct;
 
+    const bool stream_dbg = []() {
+        const char *stream_dbg_env = std::getenv("QWEN3_TTS_STREAM_DEBUG");
+        if (!stream_dbg_env || stream_dbg_env[0] == '\0') {
+            return false;
+        }
+        std::string v = stream_dbg_env;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }();
+
     bool stream_mode = false;
     bool stream_realtime = false;
     bool stream_playback = true;
     bool stream_no_playback_requested = false;
-    int32_t stream_chunk_frames = 4;
+    bool temperature_explicit = false;
+    bool top_k_explicit = false;
+    bool top_p_explicit = false;
+    bool repetition_penalty_explicit = false;
+    bool stream_left_context_explicit = false;
+    bool stream_lookahead_explicit = false;
+    int32_t stream_chunk_frames = 12;
     int32_t stream_queue_cap = 8;
     int32_t stream_poll_timeout = 100;
-    int32_t stream_decoder_left_context = 4;
-    int32_t stream_talker_attention_window = 512;
+    int32_t stream_decoder_left_context = 2;
+    int32_t stream_decoder_lookahead = 4;
+    int32_t stream_talker_attention_window = 0;
     bool stream_parallel_decode = true;
     bool stream_drop_oldest_on_overflow = false;
-    bool stream_adaptive_tuning = true;
+    bool stream_adaptive_tuning = false;
     int32_t stream_chunk_min = 2;
     int32_t stream_chunk_max = 16;
     int32_t stream_left_context_min = 2;
@@ -689,18 +759,21 @@ int main(int argc, char **argv) {
                 return 1;
             }
             params.temperature = std::stof(argv[i]);
+            temperature_explicit = true;
         } else if (arg == "--top-k") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --top-k value\n");
                 return 1;
             }
             params.top_k = std::stoi(argv[i]);
+            top_k_explicit = true;
         } else if (arg == "--top-p") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --top-p value\n");
                 return 1;
             }
             params.top_p = std::stof(argv[i]);
+            top_p_explicit = true;
         } else if (arg == "--max-tokens") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --max-tokens value\n");
@@ -713,6 +786,13 @@ int main(int argc, char **argv) {
                 return 1;
             }
             params.repetition_penalty = std::stof(argv[i]);
+            repetition_penalty_explicit = true;
+        } else if (arg == "--seed") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --seed value\n");
+                return 1;
+            }
+            params.seed = std::stoi(argv[i]);
         } else if (arg == "--stream") {
             stream_mode = true;
         } else if (arg == "--stream-realtime") {
@@ -769,6 +849,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             stream_decoder_left_context = std::max(0, std::stoi(argv[i]));
+            stream_left_context_explicit = true;
+        } else if (arg == "--stream-lookahead") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing --stream-lookahead value\n");
+                return 1;
+            }
+            stream_decoder_lookahead = std::max(0, std::stoi(argv[i]));
+            stream_lookahead_explicit = true;
         } else if (arg == "--stream-adaptive") {
             stream_adaptive_tuning = true;
         } else if (arg == "--stream-no-adaptive") {
@@ -819,26 +907,56 @@ int main(int argc, char **argv) {
     params.talker_attention_window = talker_attention_window;
 
     if (stream_realtime) {
-        // Strict realtime preset: prioritize RTF and smoothness over diversity.
-        params.temperature = 0.0f;
-        params.top_k = 0;
-        params.top_p = 1.0f;
-        params.repetition_penalty = 1.0f;
-
-        stream_chunk_frames = std::max(stream_chunk_frames, 12);
+        // Realtime preset: prioritize stable speech and RTF.
+        // Do not force greedy decoding because it can collapse into long noisy tails.
+        if (!temperature_explicit) {
+            params.temperature = 0.6f;
+        }
+        if (!top_k_explicit) {
+            params.top_k = 30;
+        }
+        if (!top_p_explicit) {
+            params.top_p = 0.95f;
+        }
+        if (!repetition_penalty_explicit) {
+            params.repetition_penalty = 1.05f;
+        }
+        stream_chunk_frames = std::max(stream_chunk_frames, 16);
         stream_chunk_min = std::max(stream_chunk_min, 8);
-        stream_chunk_max = std::max(stream_chunk_max, 24);
-        stream_decoder_left_context = std::min(stream_decoder_left_context, 2);
-        stream_left_context_min = std::min(stream_left_context_min, 2);
+        stream_chunk_max = std::max(stream_chunk_max, 32);
+        if (!stream_left_context_explicit) {
+            stream_decoder_left_context = 0;
+        }
+        if (!stream_lookahead_explicit) {
+            stream_decoder_lookahead = 0;
+        }
+        stream_left_context_min = std::min(stream_left_context_min, stream_decoder_left_context);
         stream_queue_cap = std::max(stream_queue_cap, 24);
         stream_parallel_decode = true;
         stream_drop_oldest_on_overflow = false;
-        if (stream_talker_attention_window <= 0) {
-            stream_talker_attention_window = 512;
+        stream_adaptive_tuning = false;
+
+        if (stream_dbg) {
+            fprintf(stderr,
+                    "[stream-realtime] final params: temp=%.2f top_k=%d top_p=%.2f rep=%.2f chunk=%d ctx=%d lookahead=%d adaptive=%d talker_window=%d\n",
+                    params.temperature,
+                    params.top_k,
+                    params.top_p,
+                    params.repetition_penalty,
+                    stream_chunk_frames,
+                    stream_decoder_left_context,
+                    stream_decoder_lookahead,
+                    stream_adaptive_tuning ? 1 : 0,
+                    stream_talker_attention_window);
         }
 
         fprintf(stderr,
-                "[stream-realtime] preset applied: temp=0 top_k=0 top_p=1 rep=1 chunk=%d ctx=%d queue=%d talker_window=%d\n",
+                "[stream-realtime] preset applied: temp=%.2f top_k=%d top_p=%.2f rep=%.2f max_tokens=%d chunk=%d ctx=%d queue=%d talker_window=%d\n",
+                params.temperature,
+                params.top_k,
+                params.top_p,
+                params.repetition_penalty,
+                params.max_audio_tokens,
                 stream_chunk_frames,
                 stream_decoder_left_context,
                 stream_queue_cap,
@@ -909,6 +1027,7 @@ int main(int argc, char **argv) {
         stream_params.stream_poll_timeout_ms = stream_poll_timeout;
         stream_params.stream_full_flush = false;
         stream_params.stream_decoder_left_context_frames = stream_decoder_left_context;
+        stream_params.stream_decoder_lookahead_frames = stream_decoder_lookahead;
         stream_params.stream_talker_attention_window = stream_talker_attention_window;
         stream_params.stream_adaptive_tuning = stream_adaptive_tuning;
         stream_params.stream_chunk_frames_min = stream_chunk_min;

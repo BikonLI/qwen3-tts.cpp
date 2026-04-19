@@ -174,7 +174,8 @@ public:
                 std::vector<float> & samples);
 
     // Begin incremental decode session for streaming output.
-    bool begin_stream(int32_t left_context_frames = 4);
+    bool begin_stream(int32_t left_context_frames = 4,
+                      int32_t lookahead_frames = 4);
 
     // Append new code frames and return newly produced audio samples.
     bool decode_append(const int32_t * codes, int32_t n_new_frames,
@@ -182,6 +183,9 @@ public:
 
     // Update streaming left-context while a stream is active.
     bool set_stream_left_context(int32_t left_context_frames);
+
+    // Update streaming right lookahead while a stream is active.
+    bool set_stream_lookahead(int32_t lookahead_frames);
 
     // End incremental decode session and flush pending samples.
     bool end_stream(std::vector<float> & tail_samples, bool full_flush = true);
@@ -263,12 +267,14 @@ private:
     struct stream_state {
         bool active = false;
         int32_t left_context_frames = 4;
+        int32_t lookahead_frames = 4;
         int64_t emitted_samples = 0;
         int32_t upsample_rate = 1;
         int32_t model_delay_samples = -1;
         int32_t total_frames = 0;
         int32_t history_limit_frames = 64;
         std::vector<int32_t> history_codes;
+        std::vector<int32_t> pending_codes;
         std::vector<int32_t> decode_codes;
     } stream_state_;
 

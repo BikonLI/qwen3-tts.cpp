@@ -2817,7 +2817,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                float top_p,
                                const int32_t * instruct_tokens,
                                int32_t n_instruct_tokens,
-                               const generate_frame_callback_t & on_frame) {
+                               const generate_frame_callback_t & on_frame,
+                               int32_t seed) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2841,6 +2842,12 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     if (max_len <= 0) {
         output.clear();
         return true;
+    }
+
+    if (seed >= 0) {
+        rng_.seed((uint32_t)seed);
+    } else {
+        rng_.seed(std::random_device{}());
     }
     
     const auto & cfg = model_.config;

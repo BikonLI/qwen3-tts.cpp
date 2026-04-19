@@ -1106,7 +1106,8 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     return true;
 }
 
-bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames) {
+bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames,
+                                         int32_t lookahead_frames) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
@@ -1117,16 +1118,22 @@ bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames) {
     if (left_context_frames < 0) {
         left_context_frames = 0;
     }
+    if (lookahead_frames < 0) {
+        lookahead_frames = 0;
+    }
 
     stream_state_.active = true;
     stream_state_.left_context_frames = left_context_frames;
+    stream_state_.lookahead_frames = lookahead_frames;
     stream_state_.emitted_samples = 0;
     stream_state_.upsample_rate = 1920;
     stream_state_.model_delay_samples = -1;
     stream_state_.total_frames = 0;
-    stream_state_.history_limit_frames = std::max(16, left_context_frames + 16);
+    stream_state_.history_limit_frames = std::max(16, left_context_frames + lookahead_frames + 24);
     stream_state_.history_codes.clear();
     stream_state_.history_codes.reserve((size_t)stream_state_.history_limit_frames * (size_t)cfg.n_codebooks);
+    stream_state_.pending_codes.clear();
+    stream_state_.pending_codes.reserve((size_t)std::max(8, lookahead_frames + 8) * (size_t)cfg.n_codebooks);
     stream_state_.decode_codes.clear();
     return true;
 }
@@ -1170,7 +1177,8 @@ bool AudioTokenizerDecoder::decode_chunk_with_context(const int32_t * chunk_code
     out_samples.assign(decoded.begin() + cut, decoded.end());
 
     if (stream_state_.model_delay_samples < 0 && n_context_frames > 0) {
-        const int64_t expected = (int64_t)n_chunk_frames * (int64_t)stream_state_.upsample_rate;
+        const int64_t effective_frames = std::max<int64_t>(0, (int64_t)n_chunk_frames - (int64_t)n_context_frames);
+        const int64_t expected = effective_frames * (int64_t)stream_state_.upsample_rate;
         const int64_t actual = (int64_t)out_samples.size();
         int64_t extra = actual - expected;
         if (extra > 0) {
@@ -1195,15 +1203,39 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
     }
 
     const int32_t n_codebooks = model_.config.n_codebooks;
-    const int32_t processed_frames = stream_state_.total_frames;
-    const int32_t n_ctx = std::min(stream_state_.left_context_frames, processed_frames);
-    const int32_t history_frames = std::min(stream_state_.history_limit_frames, processed_frames);
+    const int32_t lookahead_frames = std::max(0, stream_state_.lookahead_frames);
 
-    if (stream_state_.history_limit_frames < stream_state_.left_context_frames + n_new_frames + 8) {
-        stream_state_.history_limit_frames = stream_state_.left_context_frames + n_new_frames + 8;
+    stream_state_.pending_codes.insert(
+        stream_state_.pending_codes.end(),
+        codes,
+        codes + (size_t)n_new_frames * (size_t)n_codebooks
+    );
+
+    const int32_t pending_frames =
+        (int32_t)(stream_state_.pending_codes.size() / (size_t)n_codebooks);
+    if (pending_frames <= lookahead_frames) {
+        if (decoder_debug_enabled()) {
+            fprintf(
+                stderr,
+                "[decoder-dbg] append buffered_only new=%d pending=%d lookahead=%d total_frames=%d\n",
+                n_new_frames,
+                pending_frames,
+                lookahead_frames,
+                stream_state_.total_frames
+            );
+        }
+        return true;
     }
 
-    const int32_t n_decode_frames = n_ctx + n_new_frames;
+    const int32_t emit_frames = pending_frames - lookahead_frames;
+    const int32_t processed_frames = stream_state_.total_frames;
+    const int32_t n_ctx = std::min(stream_state_.left_context_frames, processed_frames);
+    const int32_t n_decode_frames = n_ctx + pending_frames;
+
+    if (stream_state_.history_limit_frames < stream_state_.left_context_frames + lookahead_frames + emit_frames + 8) {
+        stream_state_.history_limit_frames = stream_state_.left_context_frames + lookahead_frames + emit_frames + 8;
+    }
+
     stream_state_.decode_codes.resize((size_t)n_decode_frames * (size_t)n_codebooks);
 
     if (n_ctx > 0) {
@@ -1217,35 +1249,59 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
         std::copy(src_ctx, src_ctx + (size_t)n_ctx * (size_t)n_codebooks, stream_state_.decode_codes.begin());
     }
 
-    std::copy(codes, codes + (size_t)n_new_frames * (size_t)n_codebooks,
-              stream_state_.decode_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks);
+    std::copy(
+        stream_state_.pending_codes.begin(),
+        stream_state_.pending_codes.end(),
+        stream_state_.decode_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks
+    );
 
-    if (!decode_chunk_with_context(stream_state_.decode_codes.data(), n_decode_frames, n_ctx, out_samples, false)) {
+    std::vector<float> decoded_pending;
+    if (!decode_chunk_with_context(stream_state_.decode_codes.data(), n_decode_frames, n_ctx, decoded_pending, false)) {
         return false;
     }
 
-    stream_state_.history_codes.insert(stream_state_.history_codes.end(),
-                                       codes,
-                                       codes + (size_t)n_new_frames * (size_t)n_codebooks);
+    if (stream_state_.upsample_rate <= 0) {
+        stream_state_.upsample_rate = 1920;
+    }
+    const int64_t expected_emit_samples = (int64_t)emit_frames * (int64_t)stream_state_.upsample_rate;
+    const size_t emit_samples =
+        (size_t)std::max<int64_t>(0, std::min<int64_t>(expected_emit_samples, (int64_t)decoded_pending.size()));
 
-    if (history_frames > 0) {
-        const int32_t keep_after = std::max(stream_state_.history_limit_frames, history_frames + n_new_frames);
-        const size_t keep_codes = (size_t)keep_after * (size_t)n_codebooks;
-        if (stream_state_.history_codes.size() > keep_codes) {
-            const size_t drop = stream_state_.history_codes.size() - keep_codes;
-            stream_state_.history_codes.erase(stream_state_.history_codes.begin(),
-                                              stream_state_.history_codes.begin() + (ptrdiff_t)drop);
-        }
+    if (emit_samples > 0) {
+        out_samples.assign(decoded_pending.begin(), decoded_pending.begin() + (ptrdiff_t)emit_samples);
     }
 
-    stream_state_.total_frames += n_new_frames;
+    const size_t emit_codes = (size_t)emit_frames * (size_t)n_codebooks;
+    stream_state_.history_codes.insert(
+        stream_state_.history_codes.end(),
+        stream_state_.pending_codes.begin(),
+        stream_state_.pending_codes.begin() + (ptrdiff_t)emit_codes
+    );
+
+    stream_state_.pending_codes.erase(
+        stream_state_.pending_codes.begin(),
+        stream_state_.pending_codes.begin() + (ptrdiff_t)emit_codes
+    );
+
+    const size_t keep_codes = (size_t)std::max(1, stream_state_.history_limit_frames) * (size_t)n_codebooks;
+    if (stream_state_.history_codes.size() > keep_codes) {
+        const size_t drop = stream_state_.history_codes.size() - keep_codes;
+        stream_state_.history_codes.erase(
+            stream_state_.history_codes.begin(),
+            stream_state_.history_codes.begin() + (ptrdiff_t)drop
+        );
+    }
+
+    stream_state_.total_frames += emit_frames;
     stream_state_.emitted_samples += (int64_t)out_samples.size();
 
     if (decoder_debug_enabled()) {
         fprintf(
             stderr,
-            "[decoder-dbg] append new=%d ctx=%d decode_frames=%d out_samples=%zu total_frames=%d\n",
+            "[decoder-dbg] append new=%d emit=%d keep=%d ctx=%d decode_frames=%d out_samples=%zu total_frames=%d\n",
             n_new_frames,
+            emit_frames,
+            (int32_t)(stream_state_.pending_codes.size() / (size_t)n_codebooks),
             n_ctx,
             n_decode_frames,
             out_samples.size(),
@@ -1262,22 +1318,71 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
         return true;
     }
 
+    const int32_t n_codebooks = model_.config.n_codebooks;
+    const int32_t pending_frames =
+        (int32_t)(stream_state_.pending_codes.size() / (size_t)n_codebooks);
+
+    if (pending_frames > 0) {
+        const int32_t processed_frames = stream_state_.total_frames;
+        const int32_t n_ctx = std::min(stream_state_.left_context_frames, processed_frames);
+        const int32_t n_decode_frames = n_ctx + pending_frames;
+
+        stream_state_.decode_codes.resize((size_t)n_decode_frames * (size_t)n_codebooks);
+
+        if (n_ctx > 0) {
+            const int32_t keep_frames = (int32_t)(stream_state_.history_codes.size() / (size_t)n_codebooks);
+            if (keep_frames < n_ctx) {
+                error_msg_ = "Streaming history underflow in end_stream";
+                return false;
+            }
+            const int32_t start_ctx_frame = keep_frames - n_ctx;
+            const int32_t * src_ctx = stream_state_.history_codes.data() + (size_t)start_ctx_frame * (size_t)n_codebooks;
+            std::copy(src_ctx, src_ctx + (size_t)n_ctx * (size_t)n_codebooks, stream_state_.decode_codes.begin());
+        }
+
+        std::copy(
+            stream_state_.pending_codes.begin(),
+            stream_state_.pending_codes.end(),
+            stream_state_.decode_codes.begin() + (size_t)n_ctx * (size_t)n_codebooks
+        );
+
+        std::vector<float> final_chunk;
+        if (!decode_chunk_with_context(stream_state_.decode_codes.data(), n_decode_frames, n_ctx, final_chunk, false)) {
+            return false;
+        }
+        if (!final_chunk.empty()) {
+            tail_samples = std::move(final_chunk);
+        }
+
+        stream_state_.history_codes.insert(
+            stream_state_.history_codes.end(),
+            stream_state_.pending_codes.begin(),
+            stream_state_.pending_codes.end()
+        );
+        stream_state_.pending_codes.clear();
+        stream_state_.total_frames += pending_frames;
+        stream_state_.emitted_samples += (int64_t)tail_samples.size();
+    }
+
     if (full_flush && stream_state_.total_frames > 0 && stream_state_.model_delay_samples > 0) {
         const int32_t n_delay = std::min<int32_t>(stream_state_.model_delay_samples,
                                                   std::max<int32_t>(0, stream_state_.upsample_rate * 4));
         if (n_delay > 0) {
-            tail_samples.assign((size_t)n_delay, 0.0f);
+            const size_t base = tail_samples.size();
+            tail_samples.resize(base + (size_t)n_delay, 0.0f);
         }
     }
 
     stream_state_.active = false;
     stream_state_.left_context_frames = 4;
+    stream_state_.lookahead_frames = 4;
     stream_state_.emitted_samples = 0;
     stream_state_.upsample_rate = 1;
     stream_state_.model_delay_samples = -1;
     stream_state_.total_frames = 0;
-    stream_state_.history_limit_frames = std::max(16, stream_state_.left_context_frames + 16);
+    stream_state_.history_limit_frames = std::max(16, stream_state_.left_context_frames + stream_state_.lookahead_frames + 16);
     stream_state_.history_codes.clear();
+    stream_state_.pending_codes.clear();
     stream_state_.decode_codes.clear();
     return true;
 }
@@ -1291,7 +1396,26 @@ bool AudioTokenizerDecoder::set_stream_left_context(int32_t left_context_frames)
         left_context_frames = 0;
     }
     stream_state_.left_context_frames = left_context_frames;
-    stream_state_.history_limit_frames = std::max(stream_state_.history_limit_frames, left_context_frames + 8);
+    stream_state_.history_limit_frames = std::max(
+        stream_state_.history_limit_frames,
+        left_context_frames + stream_state_.lookahead_frames + 8
+    );
+    return true;
+}
+
+bool AudioTokenizerDecoder::set_stream_lookahead(int32_t lookahead_frames) {
+    if (!stream_state_.active) {
+        error_msg_ = "Streaming session not started";
+        return false;
+    }
+    if (lookahead_frames < 0) {
+        lookahead_frames = 0;
+    }
+    stream_state_.lookahead_frames = lookahead_frames;
+    stream_state_.history_limit_frames = std::max(
+        stream_state_.history_limit_frames,
+        stream_state_.left_context_frames + lookahead_frames + 8
+    );
     return true;
 }
 

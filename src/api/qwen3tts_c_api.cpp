@@ -52,6 +52,7 @@ static qwen3_tts::tts_params to_cpp_params(const Qwen3TtsParams * p, int32_t def
             params.n_threads = p->n_threads;
         }
         params.repetition_penalty = p->repetition_penalty;
+        params.seed              = p->seed;
         params.language_id       = p->language_id;
         params.task_type = static_cast<qwen3_tts::tts_task_type>(p->task_type);
         params.model_variant = static_cast<qwen3_tts::tts_model_variant>(p->model_variant);
@@ -91,6 +92,7 @@ void qwen3_tts_default_params(Qwen3TtsParams * params) {
     params->top_k             = 50;
     params->n_threads         = 4;
     params->repetition_penalty = 1.05f;
+    params->seed              = -1;
     params->language_id       = -1;
     params->task_type         = 0;
     params->model_variant     = 0;

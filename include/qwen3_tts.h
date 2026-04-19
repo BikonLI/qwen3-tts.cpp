@@ -69,6 +69,9 @@ namespace qwen3_tts
         // Repetition penalty for CB0 token generation (HuggingFace style)
         float repetition_penalty = 1.05f;
 
+        // Sampling seed. < 0 means nondeterministic seed.
+        int32_t seed = -1;
+
         // Language ID for codec (2050=en, 2069=ru, 2055=zh, 2058=ja, 2064=ko, 2053=de, 2061=fr, 2054=es)
         // Set to -1 for auto/no-language-control path.
         int32_t language_id = -1;
@@ -101,6 +104,7 @@ namespace qwen3_tts
         bool print_progress = false;
         bool print_timing = true;
         float repetition_penalty = 1.05f;
+        int32_t seed = -1;
         int32_t language_id = -1;
 
         // See tts_params::talker_attention_window.
@@ -177,11 +181,12 @@ namespace qwen3_tts
         tts_params tts;
 
         // Apply talker attention window during stream generation.
-        // 0 means use tts.talker_attention_window as-is.
-        int32_t stream_talker_attention_window = 512;
+        // 0 means use full history (same behavior as non-stream).
+        int32_t stream_talker_attention_window = 0;
 
         // Number of code frames to aggregate before emitting one audio chunk.
-        int32_t stream_chunk_frames = 4;
+        // Python reference pipeline defaults to 12.
+        int32_t stream_chunk_frames = 12;
 
         // Bounded output queue capacity for poll mode.
         int32_t stream_queue_capacity = 8;
@@ -195,12 +200,16 @@ namespace qwen3_tts
         bool stream_full_flush = false;
 
         // Decoder left-context frames for chunked incremental decode.
-        // Official tokenizer chunk decode commonly uses 25, but a smaller
-        // default keeps realtime playback smooth on CPU-fallback paths.
-        int32_t stream_decoder_left_context_frames = 4;
+        // Keep small by default to preserve realtime throughput.
+        int32_t stream_decoder_left_context_frames = 2;
+
+        // Decoder right lookahead frames (kept in pending buffer until ready).
+        // This mirrors the reference stream decoder latency/continuity tradeoff.
+        int32_t stream_decoder_lookahead_frames = 4;
 
         // Adaptive stream control: tune chunk/context by decode realtime ratio.
-        bool stream_adaptive_tuning = true;
+        // Disabled by default to keep stream quality stable.
+        bool stream_adaptive_tuning = false;
         int32_t stream_chunk_frames_min = 2;
         int32_t stream_chunk_frames_max = 16;
         int32_t stream_left_context_frames_min = 2;

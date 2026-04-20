@@ -610,13 +610,6 @@ void print_usage(const char *program) {
     fprintf(stderr, "  --stream-no-parallel-decode       Disable parallel decode worker\n");
     fprintf(stderr, "  --stream-drop-oldest              Drop oldest chunk on queue overflow\n");
     fprintf(stderr, "  --stream-block-on-full            Block producer on queue overflow (default)\n");
-    fprintf(stderr, "  --stream-adaptive                Enable adaptive chunk/context tuning\n");
-    fprintf(stderr, "  --stream-no-adaptive             Disable adaptive chunk/context tuning\n");
-    fprintf(stderr, "  --stream-chunk-min <n>           Adaptive chunk lower bound (default: 2)\n");
-    fprintf(stderr, "  --stream-chunk-max <n>           Adaptive chunk upper bound (default: 16)\n");
-    fprintf(stderr, "  --stream-left-context-min <n>    Adaptive context lower bound (default: 2)\n");
-    fprintf(stderr, "  --stream-adapt-high <ratio>      Expand chunk/reduce ctx threshold (default: 1.15)\n");
-    fprintf(stderr, "  --stream-adapt-low <ratio>       Recover quality threshold (default: 0.65)\n");
     fprintf(stderr, "  --stream-queue-cap <n>            Stream queue capacity (default: 8)\n");
     fprintf(stderr, "  --stream-poll-timeout <ms>        Poll timeout for stream client (default: 100)\n");
     fprintf(stderr, "  -j, --threads <n>                 Number of threads\n");
@@ -676,12 +669,6 @@ int main(int argc, char **argv) {
     int32_t stream_talker_attention_window = 0;
     bool stream_parallel_decode = true;
     bool stream_drop_oldest_on_overflow = false;
-    bool stream_adaptive_tuning = false;
-    int32_t stream_chunk_min = 2;
-    int32_t stream_chunk_max = 16;
-    int32_t stream_left_context_min = 2;
-    float stream_adapt_high = 1.15f;
-    float stream_adapt_low = 0.65f;
     int32_t talker_attention_window = 0;
 
     qwen3_tts::tts_params params;
@@ -857,40 +844,6 @@ int main(int argc, char **argv) {
             }
             stream_decoder_lookahead = std::max(0, std::stoi(argv[i]));
             stream_lookahead_explicit = true;
-        } else if (arg == "--stream-adaptive") {
-            stream_adaptive_tuning = true;
-        } else if (arg == "--stream-no-adaptive") {
-            stream_adaptive_tuning = false;
-        } else if (arg == "--stream-chunk-min") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-chunk-min value\n");
-                return 1;
-            }
-            stream_chunk_min = std::max(1, std::stoi(argv[i]));
-        } else if (arg == "--stream-chunk-max") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-chunk-max value\n");
-                return 1;
-            }
-            stream_chunk_max = std::max(1, std::stoi(argv[i]));
-        } else if (arg == "--stream-left-context-min") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-left-context-min value\n");
-                return 1;
-            }
-            stream_left_context_min = std::max(0, std::stoi(argv[i]));
-        } else if (arg == "--stream-adapt-high") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-adapt-high value\n");
-                return 1;
-            }
-            stream_adapt_high = std::stof(argv[i]);
-        } else if (arg == "--stream-adapt-low") {
-            if (++i >= argc) {
-                fprintf(stderr, "Error: missing --stream-adapt-low value\n");
-                return 1;
-            }
-            stream_adapt_low = std::stof(argv[i]);
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --threads value\n");
@@ -922,23 +875,19 @@ int main(int argc, char **argv) {
             params.repetition_penalty = 1.05f;
         }
         stream_chunk_frames = std::max(stream_chunk_frames, 16);
-        stream_chunk_min = std::max(stream_chunk_min, 8);
-        stream_chunk_max = std::max(stream_chunk_max, 32);
         if (!stream_left_context_explicit) {
             stream_decoder_left_context = 0;
         }
         if (!stream_lookahead_explicit) {
             stream_decoder_lookahead = 0;
         }
-        stream_left_context_min = std::min(stream_left_context_min, stream_decoder_left_context);
         stream_queue_cap = std::max(stream_queue_cap, 24);
         stream_parallel_decode = true;
         stream_drop_oldest_on_overflow = false;
-        stream_adaptive_tuning = false;
 
         if (stream_dbg) {
             fprintf(stderr,
-                    "[stream-realtime] final params: temp=%.2f top_k=%d top_p=%.2f rep=%.2f chunk=%d ctx=%d lookahead=%d adaptive=%d talker_window=%d\n",
+                    "[stream-realtime] final params: temp=%.2f top_k=%d top_p=%.2f rep=%.2f chunk=%d ctx=%d lookahead=%d talker_window=%d\n",
                     params.temperature,
                     params.top_k,
                     params.top_p,
@@ -946,7 +895,6 @@ int main(int argc, char **argv) {
                     stream_chunk_frames,
                     stream_decoder_left_context,
                     stream_decoder_lookahead,
-                    stream_adaptive_tuning ? 1 : 0,
                     stream_talker_attention_window);
         }
 
@@ -1029,17 +977,8 @@ int main(int argc, char **argv) {
         stream_params.stream_decoder_left_context_frames = stream_decoder_left_context;
         stream_params.stream_decoder_lookahead_frames = stream_decoder_lookahead;
         stream_params.stream_talker_attention_window = stream_talker_attention_window;
-        stream_params.stream_adaptive_tuning = stream_adaptive_tuning;
-        stream_params.stream_chunk_frames_min = stream_chunk_min;
-        stream_params.stream_chunk_frames_max = std::max(stream_chunk_min, stream_chunk_max);
-        stream_params.stream_left_context_frames_min = stream_left_context_min;
-        stream_params.stream_adaptive_high_ratio = std::max(0.1f, stream_adapt_high);
-        stream_params.stream_adaptive_low_ratio = std::max(0.05f, stream_adapt_low);
         stream_params.stream_parallel_decode = stream_parallel_decode;
         stream_params.stream_drop_oldest_on_overflow = stream_drop_oldest_on_overflow;
-        if (stream_params.stream_adaptive_low_ratio > stream_params.stream_adaptive_high_ratio) {
-            stream_params.stream_adaptive_low_ratio = stream_params.stream_adaptive_high_ratio;
-        }
 
         std::shared_ptr<qwen3_tts::tts_stream_session> session;
         if (!reference_audio.empty()) {

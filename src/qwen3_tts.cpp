@@ -1457,9 +1457,6 @@ namespace qwen3_tts {
                 int32_t pending_frames = 0;
                 bool any_chunk_emitted = false;
                 const bool stream_dbg = stream_debug_enabled();
-                if (params.stream_adaptive_tuning) {
-                    fprintf(stderr, "[stream] adaptive tuning is disabled; using fixed chunk/context\n");
-                }
                 int64_t stream_t0_ms = get_time_ms();
                 int64_t t_tok_ms = 0;
                 int64_t t_gen_cb_ms = 0;

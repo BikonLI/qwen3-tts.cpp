@@ -207,15 +207,6 @@ namespace qwen3_tts
         // This mirrors the reference stream decoder latency/continuity tradeoff.
         int32_t stream_decoder_lookahead_frames = 4;
 
-        // Adaptive stream control: tune chunk/context by decode realtime ratio.
-        // Disabled by default to keep stream quality stable.
-        bool stream_adaptive_tuning = false;
-        int32_t stream_chunk_frames_min = 2;
-        int32_t stream_chunk_frames_max = 16;
-        int32_t stream_left_context_frames_min = 2;
-        float stream_adaptive_high_ratio = 1.15f;
-        float stream_adaptive_low_ratio = 0.65f;
-
         // Run decode+emit in a dedicated worker to overlap generation and vocoder.
         bool stream_parallel_decode = true;
 

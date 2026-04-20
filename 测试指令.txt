@@ -53,5 +53,8 @@ New-Item -ItemType Directory -Force .\outputs | Out-Null
 
 .\build\Release\qwen3-tts-cli.exe  -m .\models\gguf\0.6b-custom-voice\qwen3-tts-12hz-0.6b-custom-voice-f16.gguf  -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --stream --stream-realtime --speaker eric
 
-# 若要做纯性能基准（不播放），可使用：
-# .\build\Release\qwen3-tts-cli.exe -m .\models\gguf\0.6b-custom-voice\qwen3-tts-12hz-0.6b-custom-voice-f16.gguf -mt .\models\gguf\tokenizer\qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --stream --stream-realtime --stream-no-playback --speaker eric
+9) 0.6B CustomVoice - stream-realtime
+.\build\Release\qwen3-tts-cli.exe -m models/gguf/0.6b-custom-voice/qwen3-tts-12hz-0.6b-custom-voice-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --speaker ryan --stream --stream-realtime   
+
+10) 1.7B CustomVoice -stream-realtime
+.\build\Release\qwen3-tts-cli.exe -m models/gguf/1.7b-custom-voice/qwen3-tts-12hz-1.7b-custom-voice-f16.gguf -mt models/gguf/tokenizer/qwen3-tts-tokenizer-12hz-f16.gguf -t ".\text\test1.txt" --speaker ryan --stream --stream-realtime   

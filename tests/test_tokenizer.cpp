@@ -78,6 +78,20 @@ int main(int argc, char ** argv) {
         if (i + 1 < tokens.size()) printf(", ");
     }
     printf("]\n");
+
+    // Test 3b: Numeric/symbol rich text should keep digits and punctuation
+    printf("Test 3b: Encode numbers/symbols sentence\n");
+    const std::string numeric_text =
+        "Finally, please read the following numbers and symbols correctly: 0, 1, 2, 10, 100, 1,000, 3.14159, 99.9%, and $42.50.";
+    auto numeric_tokens = tokenizer.encode(numeric_text);
+    auto decoded_numeric = tokenizer.decode(numeric_tokens);
+    if (decoded_numeric == numeric_text) {
+        printf("  PASS: Numeric/symbol sentence roundtrip preserved\n\n");
+    } else {
+        printf("  FAIL: Numeric/symbol sentence roundtrip mismatch\n");
+        printf("  Decoded: '%s'\n\n", decoded_numeric.c_str());
+        return 1;
+    }
     
     // Check expected tokens for "Hello." (without TTS format)
     // Expected: [9707, 13] for "Hello" and "."

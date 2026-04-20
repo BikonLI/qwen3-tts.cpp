@@ -151,7 +151,6 @@ struct audio_decoder_state {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
-    std::vector<uint8_t> compute_meta;
 };
 
 // Audio tokenizer decoder (vocoder) class
@@ -173,6 +172,23 @@ public:
     // Returns: audio samples normalized to [-1, 1] at 24kHz
     bool decode(const int32_t * codes, int32_t n_frames,
                 std::vector<float> & samples);
+
+    // Begin incremental decode session for streaming output.
+    bool begin_stream(int32_t left_context_frames = 4,
+                      int32_t lookahead_frames = 4);
+
+    // Append new code frames and return newly produced audio samples.
+    bool decode_append(const int32_t * codes, int32_t n_new_frames,
+                       std::vector<float> & out_samples);
+
+    // Update streaming left-context while a stream is active.
+    bool set_stream_left_context(int32_t left_context_frames);
+
+    // Update streaming right lookahead while a stream is active.
+    bool set_stream_lookahead(int32_t lookahead_frames);
+
+    // End incremental decode session and flush pending samples.
+    bool end_stream(std::vector<float> & tail_samples, bool full_flush = true);
     
     const audio_decoder_config & get_config() const { return model_.config; }
 
@@ -184,7 +200,7 @@ public:
     
 private:
     // Build computation graph for decoding
-    struct ggml_cgraph * build_graph(int32_t n_frames);
+    struct ggml_cgraph * build_graph(struct ggml_context * ctx0, int32_t n_frames);
     
     // Apply Snake activation: x + (1/alpha) * sin^2(alpha * x)
     struct ggml_tensor * apply_snake(struct ggml_context * ctx,
@@ -228,9 +244,61 @@ private:
     audio_decoder_model model_;
     audio_decoder_state state_;
     std::string error_msg_;
-    
-    // Temporary storage for codes input
-    std::vector<int32_t> codes_buf_;
+
+    struct decode_graph_cache_entry {
+        int32_t n_frames = -1;
+        uint64_t use_tick = 0;
+        bool sched_allocated = false;
+        bool positions_uploaded = false;
+        std::vector<uint8_t> meta;
+        struct ggml_context * ctx = nullptr;
+        struct ggml_cgraph * gf = nullptr;
+        struct ggml_tensor * cb_tensors[16] = {nullptr};
+        struct ggml_tensor * positions = nullptr;
+        struct ggml_tensor * audio = nullptr;
+        std::vector<int32_t> cb_codes[16];
+        std::vector<int32_t> positions_buf;
+    };
+
+    std::vector<decode_graph_cache_entry> decode_graph_cache_;
+    int32_t active_decode_graph_frames_ = -1;
+    uint64_t decode_graph_use_tick_ = 0;
+
+    static constexpr int32_t DECODE_GRAPH_CACHE_MAX = 6;
+
+    void free_decode_graph_entry(decode_graph_cache_entry & entry);
+    bool ensure_decode_graph(int32_t n_frames, decode_graph_cache_entry *& entry_out);
+    void reset_decode_graph_cache();
+    void apply_graph_backend_hints(decode_graph_cache_entry & entry);
+
+    bool decode_chunk_with_context(const int32_t * chunk_codes,
+                                   int32_t n_chunk_frames,
+                                   int32_t n_context_frames,
+                                   std::vector<float> & out_samples,
+                                   bool full_output);
+
+    void blend_stream_audio(const std::vector<float> & chunk_samples,
+                            bool is_final,
+                            std::vector<float> & out_samples);
+
+    void apply_stream_start_fade(std::vector<float> & samples);
+
+    struct stream_state {
+        bool active = false;
+        int32_t left_context_frames = 4;
+        int32_t lookahead_frames = 4;
+        int64_t emitted_samples = 0;
+        int32_t upsample_rate = 1;
+        int32_t model_delay_samples = -1;
+        int32_t total_frames = 0;
+        int32_t history_limit_frames = 64;
+        int32_t seam_crossfade_samples = 96;
+        int32_t start_fade_samples = 96;
+        std::vector<int32_t> history_codes;
+        std::vector<int32_t> pending_codes;
+        std::vector<int32_t> decode_codes;
+        std::vector<float> seam_tail_samples;
+    } stream_state_;
 };
 
 // Free model resources

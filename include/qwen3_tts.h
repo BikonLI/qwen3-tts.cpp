@@ -69,6 +69,9 @@ namespace qwen3_tts
         // Repetition penalty for CB0 token generation (HuggingFace style)
         float repetition_penalty = 1.05f;
 
+        // Sampling seed. < 0 means nondeterministic seed.
+        int32_t seed = -1;
+
         // Language ID for codec (2050=en, 2069=ru, 2055=zh, 2058=ja, 2064=ko, 2053=de, 2061=fr, 2054=es)
         // Set to -1 for auto/no-language-control path.
         int32_t language_id = -1;
@@ -84,6 +87,10 @@ namespace qwen3_tts
 
         // Base model option: when true, run with x-vector only and do not require reference_text.
         bool x_vector_only_mode = false;
+
+        // Limit talker decode attention to the most recent N tokens.
+        // 0 disables the limit (full attention over all past tokens).
+        int32_t talker_attention_window = 0;
     };
 
     // Common generation controls shared by all typed APIs below.
@@ -97,7 +104,11 @@ namespace qwen3_tts
         bool print_progress = false;
         bool print_timing = true;
         float repetition_penalty = 1.05f;
+        int32_t seed = -1;
         int32_t language_id = -1;
+
+        // See tts_params::talker_attention_window.
+        int32_t talker_attention_window = 0;
     };
 
     // Voice clone params for Base model families (0.6B/1.7B).
@@ -165,6 +176,96 @@ namespace qwen3_tts
     // Progress callback type
     using tts_progress_callback_t = std::function<void(int tokens_generated, int max_tokens)>;
 
+    struct tts_stream_params
+    {
+        tts_params tts;
+
+        // Apply talker attention window during stream generation.
+        // 0 means use full history (same behavior as non-stream).
+        int32_t stream_talker_attention_window = 0;
+
+        // Number of code frames to aggregate before emitting one audio chunk.
+        // Python reference pipeline defaults to 12.
+        int32_t stream_chunk_frames = 12;
+
+        // Bounded output queue capacity for poll mode.
+        int32_t stream_queue_capacity = 8;
+
+        // Default poll timeout in milliseconds when caller passes timeout < 0.
+        int32_t stream_poll_timeout_ms = 100;
+
+        // Run end-of-stream flush decode before finish.
+        // Disabled by default because delay-compensated incremental decode
+        // usually avoids the expensive full utterance re-decode.
+        bool stream_full_flush = false;
+
+        // Decoder left-context frames for chunked incremental decode.
+        // Keep small by default to preserve realtime throughput.
+        int32_t stream_decoder_left_context_frames = 2;
+
+        // Decoder right lookahead frames (kept in pending buffer until ready).
+        // This mirrors the reference stream decoder latency/continuity tradeoff.
+        int32_t stream_decoder_lookahead_frames = 4;
+
+        // Run decode+emit in a dedicated worker to overlap generation and vocoder.
+        bool stream_parallel_decode = true;
+
+        // Queue overflow policy: true drops oldest chunk, false blocks producer.
+        bool stream_drop_oldest_on_overflow = false;
+    };
+
+    struct tts_audio_chunk
+    {
+        std::vector<float> audio;
+        int32_t sample_rate = 24000;
+        int64_t chunk_id = 0;
+        bool is_last = false;
+        int32_t dropped_before = 0;
+    };
+
+    using tts_stream_audio_callback_t = std::function<void(const tts_audio_chunk &chunk)>;
+    using tts_stream_codes_callback_t =
+        std::function<void(const int32_t *frame_codes, int32_t n_codebooks, int32_t frame_index)>;
+    using tts_stream_finish_callback_t = std::function<void()>;
+    using tts_stream_error_callback_t = std::function<void(const std::string &error_msg)>;
+
+    struct tts_stream_callbacks
+    {
+        tts_stream_audio_callback_t on_audio_chunk;
+        tts_stream_codes_callback_t on_codes_frame;
+        tts_stream_finish_callback_t on_finish;
+        tts_stream_error_callback_t on_error;
+    };
+
+    enum class tts_stream_poll_status
+    {
+        chunk = 0,
+        timeout = 1,
+        finished = 2,
+        error = 3,
+    };
+
+    class tts_stream_session
+    {
+    public:
+        struct impl;
+
+        ~tts_stream_session();
+
+        tts_stream_poll_status poll(tts_audio_chunk &chunk, int32_t timeout_ms = -1);
+
+        bool is_finished() const;
+        bool has_error() const;
+        std::string get_error() const;
+        int32_t dropped_chunks() const;
+
+    private:
+        explicit tts_stream_session(const std::shared_ptr<impl> &impl_ptr);
+
+        std::shared_ptr<impl> impl_;
+        friend class Qwen3TTS;
+    };
+
     // Main TTS class that orchestrates the full pipeline
     class Qwen3TTS
     {
@@ -221,6 +322,36 @@ namespace qwen3_tts
         // Set progress callback
         void set_progress_callback(tts_progress_callback_t callback);
 
+        // Stream synthesis (whole text input + chunked audio output).
+        std::shared_ptr<tts_stream_session> synthesize_stream(
+            const std::string &text,
+            const tts_stream_params &params = tts_stream_params(),
+            const tts_stream_callbacks &callbacks = tts_stream_callbacks()
+        );
+
+        std::shared_ptr<tts_stream_session> synthesize_with_voice_stream(
+            const std::string &text,
+            const std::string &reference_audio,
+            const tts_stream_params &params = tts_stream_params(),
+            const tts_stream_callbacks &callbacks = tts_stream_callbacks()
+        );
+
+        std::shared_ptr<tts_stream_session> synthesize_with_voice_stream(
+            const std::string &text,
+            const float *ref_samples,
+            int32_t n_ref_samples,
+            const tts_stream_params &params = tts_stream_params(),
+            const tts_stream_callbacks &callbacks = tts_stream_callbacks()
+        );
+
+        std::shared_ptr<tts_stream_session> synthesize_with_embedding_stream(
+            const std::string &text,
+            const float *embedding,
+            int32_t embedding_size,
+            const tts_stream_params &params = tts_stream_params(),
+            const tts_stream_callbacks &callbacks = tts_stream_callbacks()
+        );
+
         // Get error message
         const std::string &get_error() const { return error_msg_; }
 
@@ -236,6 +367,14 @@ namespace qwen3_tts
                                        const float *speaker_embedding,
                                        const tts_params &params,
                                        tts_result &result);
+
+        std::shared_ptr<tts_stream_session> synthesize_stream_internal(
+            const std::string &text,
+            const std::vector<float> &speaker_embedding,
+            bool has_speaker_embedding,
+            const tts_stream_params &params,
+            const tts_stream_callbacks &callbacks
+        );
 
         std::unique_ptr<TextTokenizer> tokenizer_;
         std::unique_ptr<TTSTransformer> transformer_;
@@ -253,6 +392,9 @@ namespace qwen3_tts
         std::string tts_model_path_;
         std::string decoder_model_path_;
         tts_progress_callback_t progress_callback_;
+        mutable std::mutex stream_mutex_;
+        bool stream_active_ = false;
+        std::shared_ptr<tts_stream_session::impl> stream_impl_;
     };
 
     // Multi-model manager with model-specific load/synthesis APIs.

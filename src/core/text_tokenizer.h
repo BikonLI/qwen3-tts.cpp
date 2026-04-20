@@ -88,6 +88,9 @@ private:
     
     // BPE encoding for a single word
     std::vector<std::string> bpe(const std::string & token) const;
+
+    // Byte-level fallback when a merged token is not in vocab.
+    std::vector<int32_t> encode_unknown_bpe_token_bytes(const std::string & token) const;
     
     // Find the pair with lowest rank in a sequence
     std::pair<std::string, std::string> get_min_pair(

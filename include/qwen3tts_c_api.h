@@ -19,6 +19,7 @@ typedef struct Qwen3TtsParams {
     int32_t top_k;               /* default: 50, 0=disabled */
     int32_t n_threads;           /* default: 4 */
     float   repetition_penalty;  /* default: 1.05 */
+    int32_t seed;                /* default: -1, <0=random */
     int32_t language_id;         /* -1=auto, 2050=en, 2058=ja, 2055=zh, etc. */
 
     int32_t task_type;           /* 0=auto,1=voice_clone,2=custom_voice,3=voice_design */

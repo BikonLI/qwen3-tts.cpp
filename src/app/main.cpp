@@ -270,8 +270,7 @@ public:
             return false;
         }
 
-        audio_was_initialized_ = (SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0;
-        if (!audio_was_initialized_) {
+        if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) == 0) {
             if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
                 error_msg = std::string("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: ") + SDL_GetError();
                 return false;
@@ -361,7 +360,6 @@ private:
     }
 
     SDL_AudioStream *stream_ = nullptr;
-    bool audio_was_initialized_ = false;
     bool initialized_audio_ = false;
 };
 

@@ -264,20 +264,6 @@ private:
     int32_t active_decode_graph_frames_ = -1;
     uint64_t decode_graph_use_tick_ = 0;
 
-    struct stream_state {
-        bool active = false;
-        int32_t left_context_frames = 4;
-        int32_t lookahead_frames = 4;
-        int64_t emitted_samples = 0;
-        int32_t upsample_rate = 1;
-        int32_t model_delay_samples = -1;
-        int32_t total_frames = 0;
-        int32_t history_limit_frames = 64;
-        std::vector<int32_t> history_codes;
-        std::vector<int32_t> pending_codes;
-        std::vector<int32_t> decode_codes;
-    } stream_state_;
-
     static constexpr int32_t DECODE_GRAPH_CACHE_MAX = 6;
 
     void free_decode_graph_entry(decode_graph_cache_entry & entry);
@@ -290,6 +276,29 @@ private:
                                    int32_t n_context_frames,
                                    std::vector<float> & out_samples,
                                    bool full_output);
+
+    void blend_stream_audio(const std::vector<float> & chunk_samples,
+                            bool is_final,
+                            std::vector<float> & out_samples);
+
+    void apply_stream_start_fade(std::vector<float> & samples);
+
+    struct stream_state {
+        bool active = false;
+        int32_t left_context_frames = 4;
+        int32_t lookahead_frames = 4;
+        int64_t emitted_samples = 0;
+        int32_t upsample_rate = 1;
+        int32_t model_delay_samples = -1;
+        int32_t total_frames = 0;
+        int32_t history_limit_frames = 64;
+        int32_t seam_crossfade_samples = 96;
+        int32_t start_fade_samples = 96;
+        std::vector<int32_t> history_codes;
+        std::vector<int32_t> pending_codes;
+        std::vector<int32_t> decode_codes;
+        std::vector<float> seam_tail_samples;
+    } stream_state_;
 };
 
 // Free model resources

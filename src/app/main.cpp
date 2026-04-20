@@ -661,6 +661,7 @@ int main(int argc, char **argv) {
     bool repetition_penalty_explicit = false;
     bool stream_left_context_explicit = false;
     bool stream_lookahead_explicit = false;
+    bool seed_explicit = false;
     int32_t stream_chunk_frames = 12;
     int32_t stream_queue_cap = 8;
     int32_t stream_poll_timeout = 100;
@@ -780,6 +781,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             params.seed = std::stoi(argv[i]);
+            seed_explicit = true;
         } else if (arg == "--stream") {
             stream_mode = true;
         } else if (arg == "--stream-realtime") {
@@ -874,12 +876,15 @@ int main(int argc, char **argv) {
         if (!repetition_penalty_explicit) {
             params.repetition_penalty = 1.05f;
         }
+        if (!seed_explicit) {
+            params.seed = 123;
+        }
         stream_chunk_frames = std::max(stream_chunk_frames, 16);
         if (!stream_left_context_explicit) {
-            stream_decoder_left_context = 0;
+            stream_decoder_left_context = 1;
         }
         if (!stream_lookahead_explicit) {
-            stream_decoder_lookahead = 0;
+            stream_decoder_lookahead = 2;
         }
         stream_queue_cap = std::max(stream_queue_cap, 24);
         stream_parallel_decode = true;

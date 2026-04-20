@@ -1135,6 +1135,8 @@ bool AudioTokenizerDecoder::begin_stream(int32_t left_context_frames,
     stream_state_.pending_codes.clear();
     stream_state_.pending_codes.reserve((size_t)std::max(8, lookahead_frames + 8) * (size_t)cfg.n_codebooks);
     stream_state_.decode_codes.clear();
+    stream_state_.seam_tail_samples.clear();
+    stream_state_.start_fade_samples = 96;
     return true;
 }
 
@@ -1188,6 +1190,122 @@ bool AudioTokenizerDecoder::decode_chunk_with_context(const int32_t * chunk_code
         }
     }
     return true;
+}
+
+void AudioTokenizerDecoder::blend_stream_audio(const std::vector<float> & chunk_samples,
+                                               bool is_final,
+                                               std::vector<float> & out_samples) {
+    out_samples.clear();
+
+    const int32_t crossfade = std::max(0, stream_state_.seam_crossfade_samples);
+    if (crossfade == 0) {
+        if (!stream_state_.seam_tail_samples.empty()) {
+            out_samples.insert(out_samples.end(),
+                               stream_state_.seam_tail_samples.begin(),
+                               stream_state_.seam_tail_samples.end());
+            stream_state_.seam_tail_samples.clear();
+        }
+        out_samples.insert(out_samples.end(), chunk_samples.begin(), chunk_samples.end());
+        return;
+    }
+
+    if (!is_final) {
+        if ((int32_t)chunk_samples.size() <= crossfade) {
+            if (stream_state_.seam_tail_samples.empty()) {
+                stream_state_.seam_tail_samples = chunk_samples;
+            } else {
+                const size_t old_sz = stream_state_.seam_tail_samples.size();
+                stream_state_.seam_tail_samples.resize(old_sz + chunk_samples.size());
+                std::copy(chunk_samples.begin(), chunk_samples.end(),
+                          stream_state_.seam_tail_samples.begin() + (ptrdiff_t)old_sz);
+                if (stream_state_.seam_tail_samples.size() > (size_t)crossfade) {
+                    const size_t drop = stream_state_.seam_tail_samples.size() - (size_t)crossfade;
+                    stream_state_.seam_tail_samples.erase(
+                        stream_state_.seam_tail_samples.begin(),
+                        stream_state_.seam_tail_samples.begin() + (ptrdiff_t)drop
+                    );
+                }
+            }
+            return;
+        }
+
+        const size_t body_len = chunk_samples.size() - (size_t)crossfade;
+        out_samples.reserve((stream_state_.seam_tail_samples.empty() ? 0 : stream_state_.seam_tail_samples.size()) + body_len);
+
+        if (!stream_state_.seam_tail_samples.empty()) {
+            const size_t xfade = std::min(stream_state_.seam_tail_samples.size(), body_len);
+            const size_t tail_head = stream_state_.seam_tail_samples.size() - xfade;
+
+            out_samples.insert(out_samples.end(),
+                               stream_state_.seam_tail_samples.begin(),
+                               stream_state_.seam_tail_samples.begin() + (ptrdiff_t)tail_head);
+
+            for (size_t i = 0; i < xfade; ++i) {
+                const float t = (float)(i + 1) / (float)(xfade + 1);
+                const float a = stream_state_.seam_tail_samples[tail_head + i];
+                const float b = chunk_samples[i];
+                out_samples.push_back(a * (1.0f - t) + b * t);
+            }
+
+            if (body_len > xfade) {
+                out_samples.insert(out_samples.end(),
+                                   chunk_samples.begin() + (ptrdiff_t)xfade,
+                                   chunk_samples.begin() + (ptrdiff_t)body_len);
+            }
+        } else {
+            out_samples.insert(out_samples.end(),
+                               chunk_samples.begin(),
+                               chunk_samples.begin() + (ptrdiff_t)body_len);
+        }
+
+        stream_state_.seam_tail_samples.assign(
+            chunk_samples.begin() + (ptrdiff_t)body_len,
+            chunk_samples.end()
+        );
+        return;
+    }
+
+    out_samples.reserve(stream_state_.seam_tail_samples.size() + chunk_samples.size());
+    if (!stream_state_.seam_tail_samples.empty()) {
+        const size_t xfade = std::min(stream_state_.seam_tail_samples.size(), chunk_samples.size());
+        const size_t tail_head = stream_state_.seam_tail_samples.size() - xfade;
+
+        out_samples.insert(out_samples.end(),
+                           stream_state_.seam_tail_samples.begin(),
+                           stream_state_.seam_tail_samples.begin() + (ptrdiff_t)tail_head);
+
+        for (size_t i = 0; i < xfade; ++i) {
+            const float t = (float)(i + 1) / (float)(xfade + 1);
+            const float a = stream_state_.seam_tail_samples[tail_head + i];
+            const float b = chunk_samples[i];
+            out_samples.push_back(a * (1.0f - t) + b * t);
+        }
+
+        if (chunk_samples.size() > xfade) {
+            out_samples.insert(out_samples.end(),
+                               chunk_samples.begin() + (ptrdiff_t)xfade,
+                               chunk_samples.end());
+        }
+        stream_state_.seam_tail_samples.clear();
+    } else {
+        out_samples.insert(out_samples.end(), chunk_samples.begin(), chunk_samples.end());
+    }
+}
+
+void AudioTokenizerDecoder::apply_stream_start_fade(std::vector<float> & samples) {
+    if (samples.empty()) {
+        return;
+    }
+    if (stream_state_.start_fade_samples <= 0) {
+        return;
+    }
+
+    const size_t n_fade = std::min<size_t>((size_t)stream_state_.start_fade_samples, samples.size());
+    for (size_t i = 0; i < n_fade; ++i) {
+        const float t = (float)(i + 1) / (float)(n_fade + 1);
+        samples[i] *= t;
+    }
+    stream_state_.start_fade_samples -= (int32_t)n_fade;
 }
 
 bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_frames,
@@ -1268,7 +1386,9 @@ bool AudioTokenizerDecoder::decode_append(const int32_t * codes, int32_t n_new_f
         (size_t)std::max<int64_t>(0, std::min<int64_t>(expected_emit_samples, (int64_t)decoded_pending.size()));
 
     if (emit_samples > 0) {
-        out_samples.assign(decoded_pending.begin(), decoded_pending.begin() + (ptrdiff_t)emit_samples);
+        std::vector<float> raw_emit(decoded_pending.begin(), decoded_pending.begin() + (ptrdiff_t)emit_samples);
+        blend_stream_audio(raw_emit, false, out_samples);
+        apply_stream_start_fade(out_samples);
     }
 
     const size_t emit_codes = (size_t)emit_frames * (size_t)n_codebooks;
@@ -1350,9 +1470,7 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
         if (!decode_chunk_with_context(stream_state_.decode_codes.data(), n_decode_frames, n_ctx, final_chunk, false)) {
             return false;
         }
-        if (!final_chunk.empty()) {
-            tail_samples = std::move(final_chunk);
-        }
+        blend_stream_audio(final_chunk, true, tail_samples);
 
         stream_state_.history_codes.insert(
             stream_state_.history_codes.end(),
@@ -1361,8 +1479,12 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
         );
         stream_state_.pending_codes.clear();
         stream_state_.total_frames += pending_frames;
-        stream_state_.emitted_samples += (int64_t)tail_samples.size();
+    } else if (!stream_state_.seam_tail_samples.empty()) {
+        std::vector<float> empty_chunk;
+        blend_stream_audio(empty_chunk, true, tail_samples);
     }
+
+    apply_stream_start_fade(tail_samples);
 
     if (full_flush && stream_state_.total_frames > 0 && stream_state_.model_delay_samples > 0) {
         const int32_t n_delay = std::min<int32_t>(stream_state_.model_delay_samples,
@@ -1373,6 +1495,8 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
         }
     }
 
+    stream_state_.emitted_samples += (int64_t)tail_samples.size();
+
     stream_state_.active = false;
     stream_state_.left_context_frames = 4;
     stream_state_.lookahead_frames = 4;
@@ -1381,9 +1505,11 @@ bool AudioTokenizerDecoder::end_stream(std::vector<float> & tail_samples, bool f
     stream_state_.model_delay_samples = -1;
     stream_state_.total_frames = 0;
     stream_state_.history_limit_frames = std::max(16, stream_state_.left_context_frames + stream_state_.lookahead_frames + 16);
+    stream_state_.start_fade_samples = 96;
     stream_state_.history_codes.clear();
     stream_state_.pending_codes.clear();
     stream_state_.decode_codes.clear();
+    stream_state_.seam_tail_samples.clear();
     return true;
 }
 

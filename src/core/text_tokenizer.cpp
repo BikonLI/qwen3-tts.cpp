@@ -39,6 +39,38 @@ static std::unordered_map<std::string, uint8_t> build_unicode_to_byte() {
 
 static const std::unordered_map<std::string, uint8_t> UNICODE_TO_BYTE = build_unicode_to_byte();
 
+static size_t utf8_symbol_len(char c) {
+    const unsigned char uc = (unsigned char)c;
+    if ((uc & 0x80u) == 0) return 1;
+    if ((uc & 0xE0u) == 0xC0u) return 2;
+    if ((uc & 0xF0u) == 0xE0u) return 3;
+    if ((uc & 0xF8u) == 0xF0u) return 4;
+    return 1;
+}
+
+static bool unicode_symbol_to_byte(const std::string & symbol, uint8_t & out) {
+    auto it = UNICODE_TO_BYTE.find(symbol);
+    if (it == UNICODE_TO_BYTE.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+static std::vector<std::string> split_unicode_symbols(const std::string & text) {
+    std::vector<std::string> symbols;
+    symbols.reserve(text.size());
+
+    size_t i = 0;
+    while (i < text.size()) {
+        const size_t len = utf8_symbol_len(text[i]);
+        symbols.push_back(text.substr(i, len));
+        i += len;
+    }
+
+    return symbols;
+}
+
 TextTokenizer::TextTokenizer() = default;
 
 TextTokenizer::~TextTokenizer() = default;
@@ -236,6 +268,30 @@ std::vector<std::string> TextTokenizer::bpe(const std::string & token) const {
     return word;
 }
 
+std::vector<int32_t> TextTokenizer::encode_unknown_bpe_token_bytes(const std::string & token) const {
+    std::vector<int32_t> out;
+    if (token.empty()) {
+        return out;
+    }
+
+    const std::vector<std::string> symbols = split_unicode_symbols(token);
+    out.reserve(symbols.size());
+
+    for (const std::string & symbol : symbols) {
+        uint8_t byte = 0;
+        if (!unicode_symbol_to_byte(symbol, byte)) {
+            continue;
+        }
+        const std::string byte_tok = BYTE_TO_UNICODE[byte];
+        const auto it = vocab_.find(byte_tok);
+        if (it != vocab_.end()) {
+            out.push_back(it->second);
+        }
+    }
+
+    return out;
+}
+
 std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
     if (!loaded_) {
         return {};
@@ -280,14 +336,8 @@ std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
             if (it != vocab_.end()) {
                 tokens.push_back(it->second);
             } else {
-                // Unknown token - encode as bytes
-                for (unsigned char c : tok) {
-                    std::string byte_tok = BYTE_TO_UNICODE[c];
-                    auto byte_it = vocab_.find(byte_tok);
-                    if (byte_it != vocab_.end()) {
-                        tokens.push_back(byte_it->second);
-                    }
-                }
+                const std::vector<int32_t> fallback = encode_unknown_bpe_token_bytes(tok);
+                tokens.insert(tokens.end(), fallback.begin(), fallback.end());
             }
         }
     }

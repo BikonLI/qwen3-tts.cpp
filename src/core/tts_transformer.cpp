@@ -2872,6 +2872,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
+    const int32_t min_frames_before_eos = std::max(1, trailing_len);
 
     const int32_t required_ctx = prefill_len + max_len + 8;
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
@@ -2926,6 +2927,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                     }
                 }
             }
+        }
+
+        // Do not allow EOS before we have consumed the trailing text guidance.
+        // This avoids stochastic early cut-off on long paragraphs in streaming mode.
+        if (frame + 1 < min_frames_before_eos &&
+            cfg.codec_eos_id >= 0 && cfg.codec_eos_id < cfg.codec_vocab_size) {
+            logits[cfg.codec_eos_id] = -INFINITY;
         }
 
         int32_t next_token;

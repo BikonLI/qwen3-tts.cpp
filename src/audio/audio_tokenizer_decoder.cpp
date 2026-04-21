@@ -40,7 +40,7 @@ void AudioTokenizerDecoder::unload_model() {
         state_.sched = nullptr;
     }
     if (state_.backend) {
-        release_preferred_backend(state_.backend);
+        ggml_backend_free(state_.backend);
         state_.backend = nullptr;
     }
     if (state_.backend_cpu) {
@@ -351,37 +351,69 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         upload_if_present(model_.vq_rest_codebook[i]);
     }
     
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
-    if (!state_.backend) {
-        return false;
-    }
+    auto init_decoder_backend = [&]() -> bool {
+        if (state_.sched) {
+            ggml_backend_sched_free(state_.sched);
+            state_.sched = nullptr;
+        }
+        if (state_.backend) {
+            ggml_backend_free(state_.backend);
+            state_.backend = nullptr;
+        }
+        if (state_.backend_cpu) {
+            ggml_backend_free(state_.backend_cpu);
+            state_.backend_cpu = nullptr;
+        }
 
-    ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
-    const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
-    
-    if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-        state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (!state_.backend_cpu) {
-            error_msg_ = "Failed to initialize CPU fallback backend for AudioTokenizerDecoder";
+        // Use a dedicated runtime backend for decoder to avoid cross-thread
+        // contention with talker/code-predictor during streaming.
+        state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+        if (!state_.backend) {
+            state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        }
+        if (!state_.backend) {
+            state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+        }
+        if (!state_.backend) {
+            state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        }
+        if (!state_.backend) {
+            error_msg_ = "Failed to initialize backend (IGPU/GPU/ACCEL/CPU) for AudioTokenizerDecoder";
             return false;
         }
-    }
 
-    std::vector<ggml_backend_t> backends;
-    backends.push_back(state_.backend);
-    if (state_.backend_cpu) {
-        backends.push_back(state_.backend_cpu);
-    }
+        ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
+        const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
+        fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
 
-    if (decoder_debug_enabled()) {
-        fprintf(stderr, "[decoder-dbg] scheduler backends=%d cpu_fallback=%d\n",
-                (int)backends.size(), state_.backend_cpu ? 1 : 0);
-    }
+        if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (!state_.backend_cpu) {
+                error_msg_ = "Failed to initialize CPU fallback backend for AudioTokenizerDecoder";
+                return false;
+            }
+        }
 
-    state_.sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), QWEN3_TTS_DEC_MAX_NODES, false, true);
-    if (!state_.sched) {
-        error_msg_ = "Failed to create backend scheduler";
+        std::vector<ggml_backend_t> backends;
+        backends.push_back(state_.backend);
+        if (state_.backend_cpu) {
+            backends.push_back(state_.backend_cpu);
+        }
+
+        if (decoder_debug_enabled()) {
+            fprintf(stderr, "[decoder-dbg] scheduler backends=%d cpu_fallback=%d\n",
+                    (int)backends.size(), state_.backend_cpu ? 1 : 0);
+        }
+
+        state_.sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), QWEN3_TTS_DEC_MAX_NODES, false, true);
+        if (!state_.sched) {
+            error_msg_ = "Failed to create backend scheduler";
+            return false;
+        }
+        return true;
+    };
+
+    if (!init_decoder_backend()) {
         return false;
     }
     
@@ -988,6 +1020,12 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
     const bool dec_dbg = decoder_debug_enabled();
     auto t0 = std::chrono::steady_clock::now();
 
+    // Rebuild decode graph cache when frame shape switches. Reusing an old
+    // shape entry (e.g. 16 -> 19 -> 16 in streaming tail) can become unstable.
+    if (active_decode_graph_frames_ >= 0 && active_decode_graph_frames_ != n_frames) {
+        reset_decode_graph_cache();
+    }
+
     decode_graph_cache_entry * graph = nullptr;
     if (!ensure_decode_graph(n_frames, graph) || !graph) {
         return false;
@@ -1030,10 +1068,21 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         }
 
         std::vector<int32_t> & cb_codes = graph->cb_codes[cb];
+        const int32_t codebook_size = std::max(1, cfg.codebook_size);
         const int32_t * src = codes + cb;
         int32_t * dst = cb_codes.data();
         for (int f = 0; f < n_frames; ++f, src += cfg.n_codebooks) {
-            dst[f] = *src;
+            const int32_t code = *src;
+            if (code < 0 || code >= codebook_size) {
+                error_msg_ = "Audio code out of range at frame=" + std::to_string(f) +
+                             ", codebook=" + std::to_string(cb) +
+                             ", value=" + std::to_string(code) +
+                             ", expected=[0," + std::to_string(codebook_size - 1) + "]";
+                active_decode_graph_frames_ = -1;
+                graph->sched_allocated = false;
+                return false;
+            }
+            dst[f] = code;
         }
 
         ggml_backend_tensor_set(cb_tensor, cb_codes.data(), 0, n_frames * sizeof(int32_t));
@@ -1060,6 +1109,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         graph->sched_allocated = false;
         return false;
     }
+
     auto t_compute = std::chrono::steady_clock::now();
 
     struct ggml_tensor * audio_tensor = graph->audio;

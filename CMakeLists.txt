@@ -33,6 +33,23 @@ set(GGML_BUILD_DIR "${GGML_DIR}/build")
 # set(SDL3_DIR "${CMAKE_SOURCE_DIR}/cmake")
 find_package(SDL3 REQUIRED)
 
+if(WIN32)
+    set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
+    add_library(imgui STATIC
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp
+    )
+    target_include_directories(imgui PUBLIC
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+    )
+    target_link_libraries(imgui PUBLIC d3d11 dxgi d3dcompiler)
+endif()
+
 
 # Detect Metal backend availability
 if(APPLE AND EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib")
@@ -109,12 +126,33 @@ target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3tts_shared
 )
 
+if(WIN32)
+    add_executable(qwen3-tts-gui WIN32
+        src/app/gui_main.cpp
+    )
+    if(MSVC)
+        target_compile_options(qwen3-tts-gui PRIVATE /utf-8)
+    endif()
+    target_link_libraries(qwen3-tts-gui PRIVATE
+        qwen3tts_shared
+        imgui
+        Comdlg32
+    )
+endif()
+
 # Install targets
 install(TARGETS qwen3tts_shared qwen3-tts-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
 )
+if(WIN32)
+    install(TARGETS qwen3-tts-gui
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
+endif()
 install(FILES
     include/qwen3_tts.h
     include/qwen3tts_c_api.h

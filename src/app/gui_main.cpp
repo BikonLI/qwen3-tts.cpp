@@ -86,9 +86,21 @@ static std::string to_lower_copy(const std::string &s) {
     return out;
 }
 
-static bool parse_language_id(bool use_zh, int32_t &out) {
-    out = use_zh ? 2055 : 2050;
-    return true;
+static bool parse_language_id_from_key(const std::string &lang, int32_t &out) {
+    if (lang == "auto") { out = -1; return true; }
+    if (lang == "en" || lang == "english") { out = 2050; return true; }
+    if (lang == "ru" || lang == "russian") { out = 2069; return true; }
+    if (lang == "zh" || lang == "chinese") { out = 2055; return true; }
+    if (lang == "ja" || lang == "japanese") { out = 2058; return true; }
+    if (lang == "ko" || lang == "korean") { out = 2064; return true; }
+    if (lang == "de" || lang == "german") { out = 2053; return true; }
+    if (lang == "fr" || lang == "french") { out = 2061; return true; }
+    if (lang == "es" || lang == "spanish") { out = 2054; return true; }
+    if (lang == "it" || lang == "italian") { out = 2070; return true; }
+    if (lang == "pt" || lang == "portuguese") { out = 2071; return true; }
+    if (lang == "beijing_dialect") { out = 2074; return true; }
+    if (lang == "sichuan_dialect") { out = 2062; return true; }
+    return false;
 }
 
 static bool load_text_or_file(const std::string &input, std::string &out_text) {
@@ -281,7 +293,7 @@ struct app_state {
 
     int model_index = 0;
     int speaker_index = 0;
-    bool lang_zh = detect_ui_lang() == ui_lang::zh;
+    int synthesis_language_index = 0;
 
     char text_input[8192] = {};
     char reference_audio[1024] = {};
@@ -314,6 +326,28 @@ struct app_state {
 
     bool request_validation_popup = false;
     std::string validation_message;
+};
+
+struct synthesis_language_option {
+    const char *key;
+    const char *name_zh;
+    const char *name_en;
+};
+
+static const synthesis_language_option k_synthesis_languages[] = {
+    {"auto", "自动", "Auto"},
+    {"en", "英语", "English"},
+    {"ru", "俄语", "Russian"},
+    {"zh", "中文", "Chinese"},
+    {"ja", "日语", "Japanese"},
+    {"ko", "韩语", "Korean"},
+    {"de", "德语", "German"},
+    {"fr", "法语", "French"},
+    {"es", "西班牙语", "Spanish"},
+    {"it", "意大利语", "Italian"},
+    {"pt", "葡萄牙语", "Portuguese"},
+    {"beijing_dialect", "北京话", "Beijing Dialect"},
+    {"sichuan_dialect", "四川话", "Sichuan Dialect"},
 };
 
 static void append_log(app_state &state, const std::string &msg) {
@@ -692,7 +726,12 @@ static void run_generation(app_state &state, model_id selected) {
     params.seed = state.seed;
     params.n_threads = state.threads;
     params.x_vector_only_mode = state.x_vector_only;
-    parse_language_id(state.lang_zh, params.language_id);
+    if (state.synthesis_language_index < 0 ||
+        state.synthesis_language_index >= (int)(sizeof(k_synthesis_languages) / sizeof(k_synthesis_languages[0])) ||
+        !parse_language_id_from_key(k_synthesis_languages[state.synthesis_language_index].key, params.language_id)) {
+        append_log(state, "[error] invalid synthesis language option");
+        return;
+    }
 
     if (state.stream_realtime) {
         params.temperature = 0.6f;
@@ -799,7 +838,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     WNDCLASSEXA wc = {sizeof(WNDCLASSEXA), CS_CLASSDC, wnd_proc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "qwen3_tts_gui", nullptr};
     RegisterClassExA(&wc);
-    HWND hwnd = CreateWindowA(wc.lpszClassName, "qwen3-tts GUI", WS_OVERLAPPEDWINDOW, 80, 80, 1280, 860, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowA(wc.lpszClassName, "Qwen3-tts.cpp", WS_OVERLAPPEDWINDOW, 80, 80, 1280, 860, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!create_device_d3d(hwnd)) {
         cleanup_device_d3d();
@@ -850,7 +889,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
         ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
-        ImGui::Begin("Qwen3 TTS", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+        ImGui::Begin(
+            "Qwen3 TTS 全系列模型",
+            nullptr,
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoScrollbar
+        );
 
         if (state.model_setup_running) {
             ImGui::TextUnformatted(tr(state.lang, "正在准备内置模型，请稍候...", "Preparing built-in models, please wait..."));
@@ -874,9 +920,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         selected = (model_id)state.model_index;
 
         ImGui::SeparatorText(tr(state.lang, "基础输入", "Input"));
-        ImGui::InputTextMultiline(tr(state.lang, "文本", "Text"), state.text_input, sizeof(state.text_input), ImVec2(-1.0f, 100));
-        ImGui::Checkbox(tr(state.lang, "中文", "Chinese"), &state.lang_zh);
-        ImGui::SameLine();
+        if (state.text_input[0] == '\0') {
+            ImGui::TextDisabled("%s", tr(state.lang, "输入需要合成的文本...", "Input text to synthesize..."));
+        }
+        ImGui::InputTextMultiline(
+            "##synthesis_text",
+            state.text_input,
+            sizeof(state.text_input),
+            ImVec2(-1.0f, 100),
+            ImGuiInputTextFlags_NoHorizontalScroll
+        );
+
+        std::vector<const char *> lang_items;
+        lang_items.reserve(sizeof(k_synthesis_languages) / sizeof(k_synthesis_languages[0]));
+        for (const auto &opt : k_synthesis_languages) {
+            lang_items.push_back(state.lang == ui_lang::zh ? opt.name_zh : opt.name_en);
+        }
+        ImGui::Combo(
+            tr(state.lang, "合成语言", "Synthesis Language"),
+            &state.synthesis_language_index,
+            lang_items.data(),
+            (int)lang_items.size()
+        );
+
         ImGui::Checkbox(tr(state.lang, "流式输出", "Streaming"), &state.stream);
         ImGui::SameLine();
         ImGui::Checkbox(tr(state.lang, "实时优先", "Realtime Priority"), &state.stream_realtime);

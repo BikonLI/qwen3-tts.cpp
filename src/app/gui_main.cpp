@@ -324,6 +324,29 @@ static std::vector<text_segment> segment_text(const std::string &input, int max_
 
     if (symbols.empty()) return segments;
 
+    // Post-pass: un-mark decimal points (e.g. "3.14") as primary breaks.
+    // A '.' between two digit characters is a decimal separator, not a sentence break.
+    for (size_t i = 1; i + 1 < symbols.size(); ++i) {
+        if (symbols[i].codepoint == '.' && symbols[i].primary_break) {
+            // Check if previous and next symbols are digits
+            bool prev_digit = (symbols[i - 1].codepoint >= '0' && symbols[i - 1].codepoint <= '9');
+            bool next_digit = (symbols[i + 1].codepoint >= '0' && symbols[i + 1].codepoint <= '9');
+            if (prev_digit && next_digit) {
+                symbols[i].primary_break = false;
+                // Also check for numbers like "3.14.5.6" - mark all consecutive decimal dots as non-break
+            }
+        }
+    }
+    // Handle edge case: number followed by period+digit at index 0
+    // and period at penultimate position before a digit
+    // Also handle: "3." at end (not a decimal) - leave as break
+    // ".5" at start - not a decimal point sentence break either
+    if (symbols.size() >= 2) {
+        if (symbols[0].codepoint == '.' && symbols[1].codepoint >= '0' && symbols[1].codepoint <= '9') {
+            symbols[0].primary_break = false;
+        }
+    }
+
     const int extra_units = (max_units * 3) / 10;
     size_t start_index = 0;
     while (start_index < symbols.size()) {
@@ -531,7 +554,7 @@ public:
     }
 
     bool push(const std::vector<float> &samples, std::string &error_msg) {
-        if (!stream_) return true;
+        if (!stream_ || cancelled_) return true;
         if (!SDL_PutAudioStreamData(stream_, samples.data(), (int)(samples.size() * sizeof(float)))) {
             error_msg = std::string("Push stream failed: ") + SDL_GetError();
             return false;
@@ -540,18 +563,29 @@ public:
     }
 
     bool finish(std::string &error_msg) {
-        if (!stream_) return true;
+        if (!stream_ || cancelled_) {
+            close();
+            return true;
+        }
         if (!SDL_FlushAudioStream(stream_)) {
             error_msg = std::string("Flush stream failed: ") + SDL_GetError();
             close();
             return false;
         }
+        // Drain with cancellation support: check cancel flag every 10ms
         while (SDL_GetAudioStreamQueued(stream_) > 0) {
+            if (cancelled_) break;
             SDL_Delay(10);
         }
         close();
         return true;
     }
+
+    void cancel() {
+        cancelled_ = true;
+    }
+
+    bool is_cancelled() const { return cancelled_; }
 
 private:
     void close() {
@@ -567,6 +601,7 @@ private:
 
     SDL_AudioStream *stream_ = nullptr;
     bool inited_ = false;
+    std::atomic<bool> cancelled_{false};
 };
 
 struct app_state {
@@ -612,6 +647,8 @@ struct app_state {
     std::atomic<int> segment_completed{0};
     std::atomic<int> progress_percent{0};
     std::atomic<bool> cancel_requested{false};
+
+    bool config_dirty = false;
 };
 
 struct synthesis_language_option {
@@ -770,6 +807,30 @@ static std::string save_file_default() {
     return (fs::current_path() / "outputs" / "tts_output.wav").string();
 }
 
+static void reset_state_to_defaults(app_state &state) {
+    state.model_index = 0;
+    state.speaker_index = 0;
+    state.synthesis_language_index = 0;
+    memset(state.text_input, 0, sizeof(state.text_input));
+    memset(state.reference_audio, 0, sizeof(state.reference_audio));
+    memset(state.reference_text_input, 0, sizeof(state.reference_text_input));
+    memset(state.instruct_input, 0, sizeof(state.instruct_input));
+    strncpy_s(state.output_path, save_file_default().c_str(), _TRUNCATE);
+    state.x_vector_only = false;
+    state.save_output = false;
+    state.play_audio = true;
+    state.stream = false;
+    state.stream_realtime = false;
+    state.temperature = 0.9f;
+    state.top_k = 50;
+    state.top_p = 1.0f;
+    state.max_tokens = 4096;
+    state.repetition_penalty = 1.05f;
+    state.seed = -1;
+    state.threads = 4;
+    state.config_dirty = true;
+}
+
 bool save_config(const app_state &state, const std::string &path) {
     std::ofstream out(path, std::ios::out | std::ios::trunc);
     if (!out.is_open()) return false;
@@ -891,7 +952,8 @@ static bool run_stream_session(
     const std::shared_ptr<qwen3_tts::tts_stream_session> &session,
     const std::string &output_file,
     bool playback_enabled,
-    std::string &error_msg
+    std::string &error_msg,
+    app_state &state
 ) {
     if (!session) {
         error_msg = "Stream session is null";
@@ -904,6 +966,18 @@ static bool run_stream_session(
     int32_t sample_rate = 24000;
 
     while (true) {
+        // Check for cancellation before polling
+        if (state.cancel_requested.load()) {
+            session->cancel();
+            // Drain remaining audio quickly without playback
+            qwen3_tts::tts_audio_chunk drain_chunk;
+            while (session->poll(drain_chunk, 10) == qwen3_tts::tts_stream_poll_status::chunk) {
+                // Just drain, don't play
+            }
+            error_msg = "cancelled";
+            return false;
+        }
+
         qwen3_tts::tts_audio_chunk chunk;
         const auto status = session->poll(chunk, 100);
         if (status == qwen3_tts::tts_stream_poll_status::timeout) continue;
@@ -1171,11 +1245,22 @@ static void run_generation(app_state &state, model_id selected) {
         return;
     }
 
+    // Set progress callback for all modes (streaming and non-streaming)
+    tts.set_progress_callback([&](int tok, int max_tok) {
+        const size_t seg_idx_cur = (size_t)state.segment_completed.load();
+        const int total_segs = state.segment_total.load();
+        if (total_segs > 0 && max_tok > 0) {
+            int seg_prog = (int)((seg_idx_cur * 100 + (size_t)tok * 100 / (size_t)max_tok) / (size_t)total_segs);
+            state.progress_percent = std::min(seg_prog, 100);
+        }
+    });
+
     const std::string output = state.save_output ? std::string(state.output_path) : std::string();
 
     if (state.stream) {
         for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
             if (state.cancel_requested.load()) {
+                tts.request_cancel();
                 append_log(state, "[cancelled] stream generation stopped");
                 break;
             }
@@ -1190,11 +1275,6 @@ static void run_generation(app_state &state, model_id selected) {
                 stream_params.stream_decoder_lookahead_frames = 2;
                 stream_params.stream_queue_capacity = std::max(stream_params.stream_queue_capacity, 24);
             }
-
-            tts.set_progress_callback([&](int tok, int max_tok) {
-                int seg_prog = (int)((seg_idx * 100 + (size_t)tok * 100 / (size_t)std::max(1, max_tok)) / segments.size());
-                state.progress_percent = seg_prog;
-            });
 
             std::shared_ptr<qwen3_tts::tts_stream_session> session;
             if (is_base(selected)) {
@@ -1211,13 +1291,20 @@ static void run_generation(app_state &state, model_id selected) {
                 stream_params.tts.instruct = instruct;
                 session = tts.synthesize_stream(segments[seg_idx].text, stream_params);
             }
+
+            state.segment_completed = (int)seg_idx;
+
             if (!session) {
                 append_log(state, "[error] " + tts.get_error());
                 return;
             }
             std::string err;
-            if (!run_stream_session(session, output, state.play_audio, err)) {
-                append_log(state, "[error] " + err);
+            if (!run_stream_session(session, output, state.play_audio, err, state)) {
+                if (state.cancel_requested.load()) {
+                    append_log(state, "[cancelled] stream generation stopped");
+                } else {
+                    append_log(state, "[error] " + err);
+                }
                 return;
             }
 
@@ -1235,6 +1322,7 @@ static void run_generation(app_state &state, model_id selected) {
 
     for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
         if (state.cancel_requested.load()) {
+            tts.request_cancel();
             append_log(state, "[cancelled] generation stopped");
             break;
         }
@@ -1258,7 +1346,11 @@ static void run_generation(app_state &state, model_id selected) {
         }
 
         if (!result.success) {
-            append_log(state, "[error] " + result.error_msg);
+            if (state.cancel_requested.load()) {
+                append_log(state, "[cancelled] generation stopped");
+            } else {
+                append_log(state, "[error] " + result.error_msg);
+            }
             return;
         }
 
@@ -1269,20 +1361,51 @@ static void run_generation(app_state &state, model_id selected) {
         state.progress_percent = (int)((seg_idx + 1) * 100 / segments.size());
     }
 
-    if (!all_audio.empty()) {
+    tts.set_progress_callback(nullptr);
+
+    if (!all_audio.empty() && !state.cancel_requested.load()) {
         if (state.save_output && !qwen3_tts::save_audio_file(output, all_audio, sample_rate)) {
             append_log(state, "[error] save output failed");
             state.progress_percent = 0;
             return;
         }
-        if (state.play_audio && !qwen3_tts::play_audio(all_audio, sample_rate)) {
-            append_log(state, "[error] playback failed");
-            state.progress_percent = 0;
-            return;
+        if (state.play_audio) {
+            // Play audio with cancellation support
+            StreamPlayer player;
+            std::string play_err;
+            if (!player.open(sample_rate, play_err)) {
+                append_log(state, "[error] " + play_err);
+                state.progress_percent = 0;
+                return;
+            }
+            // Push audio in chunks for cancellable playback
+            const size_t chunk_size = 2400; // ~100ms at 24kHz
+            size_t offset = 0;
+            while (offset < all_audio.size()) {
+                if (state.cancel_requested.load()) {
+                    player.cancel();
+                    append_log(state, "[cancelled] playback stopped");
+                    break;
+                }
+                size_t end = std::min(offset + chunk_size, all_audio.size());
+                std::vector<float> chunk(all_audio.begin() + offset, all_audio.begin() + end);
+                if (!player.push(chunk, play_err)) {
+                    append_log(state, "[error] " + play_err);
+                    break;
+                }
+                offset = end;
+            }
+            if (!player.is_cancelled()) {
+                player.finish(play_err);
+            }
         }
     }
 
-    append_log(state, "[ok] generation done");
+    if (state.cancel_requested.load()) {
+        append_log(state, "[cancelled] generation stopped");
+    } else {
+        append_log(state, "[ok] generation done");
+    }
     state.progress_percent = 0;
 }
 
@@ -1331,7 +1454,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     strncpy_s(state.output_path, save_file_default().c_str(), _TRUNCATE);
 
     const std::string config_path = save_config_path();
-    if (!fs::exists(config_path)) {
+    if (fs::exists(config_path)) {
+        if (load_config(state, config_path)) {
+            append_log(state, tr(state.lang, "[ok] 已加载配置", "[ok] config loaded"));
+        } else {
+            append_log(state, tr(state.lang, "[warn] 配置加载失败，使用默认值", "[warn] config load failed, using defaults"));
+        }
+    } else {
         if (save_config(state, config_path)) {
             append_log(state, tr(state.lang, "[ok] 已创建默认配置: ", "[ok] created default config: ") + config_path);
         } else {
@@ -1382,26 +1511,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::TextUnformatted(tr(state.lang, "内置模型已就绪", "Built-in models ready"));
         }
 
-        if (ImGui::Button(tr(state.lang, "保存配置", "Save Config"))) {
+        if (ImGui::Button(tr(state.lang, "重置参数", "Reset Parameters"))) {
+            reset_state_to_defaults(state);
             if (save_config(state, save_config_path())) {
-                append_log(state, tr(state.lang, "[ok] 配置已保存", "[ok] config saved"));
-            } else {
-                append_log(state, tr(state.lang, "[error] 配置保存失败", "[error] failed to save config"));
+                append_log(state, tr(state.lang, "[ok] 参数已重置并保存", "[ok] parameters reset and saved"));
             }
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", tr(state.lang, "保存当前界面参数到 gui_config.ini", "Save current UI parameters to gui_config.ini"));
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(tr(state.lang, "恢复配置", "Restore Config"))) {
-            if (load_config(state, save_config_path())) {
-                append_log(state, tr(state.lang, "[ok] 配置已恢复", "[ok] config restored"));
-            } else {
-                append_log(state, tr(state.lang, "[error] 配置恢复失败", "[error] failed to restore config"));
-            }
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", tr(state.lang, "从 gui_config.ini 恢复界面参数", "Restore UI parameters from gui_config.ini"));
+            ImGui::SetTooltip("%s", tr(state.lang, "重置所有参数为默认值", "Reset all parameters to defaults"));
         }
 
         model_id selected = (model_id)state.model_index;
@@ -1414,44 +1531,50 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         };
 
         ImGui::SeparatorText(tr(state.lang, "模型", "Model"));
-        ImGui::Combo(tr(state.lang, "模型选择", "Model Selection"), &state.model_index, model_items, 5);
+        if (ImGui::Combo(tr(state.lang, "模型选择", "Model Selection"), &state.model_index, model_items, 5)) {
+            state.config_dirty = true;
+        }
         selected = (model_id)state.model_index;
 
         ImGui::SeparatorText(tr(state.lang, "基础输入", "Input"));
         if (state.text_input[0] == '\0') {
             ImGui::TextDisabled("%s", tr(state.lang, "输入需要合成的文本...", "Input text to synthesize..."));
         }
-        ImGui::InputTextMultiline(
+        if (ImGui::InputTextMultiline(
             "##synthesis_text",
             state.text_input,
             sizeof(state.text_input),
-            ImVec2(-1.0f, 100),
+            ImVec2(-1.0f, 180),
             ImGuiInputTextFlags_NoHorizontalScroll
-        );
+        )) {
+            state.config_dirty = true;
+        }
 
         std::vector<const char *> lang_items;
         lang_items.reserve(sizeof(k_synthesis_languages) / sizeof(k_synthesis_languages[0]));
         for (const auto &opt : k_synthesis_languages) {
             lang_items.push_back(state.lang == ui_lang::zh ? opt.name_zh : opt.name_en);
         }
-        ImGui::Combo(
+        if (ImGui::Combo(
             tr(state.lang, "合成语言", "Synthesis Language"),
             &state.synthesis_language_index,
             lang_items.data(),
             (int)lang_items.size()
-        );
+        )) {
+            state.config_dirty = true;
+        }
 
-        ImGui::Checkbox(tr(state.lang, "流式输出", "Streaming"), &state.stream);
+        if (ImGui::Checkbox(tr(state.lang, "流式输出", "Streaming"), &state.stream)) { state.config_dirty = true; }
         ImGui::SameLine();
-        ImGui::Checkbox(tr(state.lang, "实时优先", "Realtime Priority"), &state.stream_realtime);
+        if (ImGui::Checkbox(tr(state.lang, "实时优先", "Realtime Priority"), &state.stream_realtime)) { state.config_dirty = true; }
         ImGui::SameLine();
-        ImGui::Checkbox(tr(state.lang, "播放音频", "Play Audio"), &state.play_audio);
+        if (ImGui::Checkbox(tr(state.lang, "播放音频", "Play Audio"), &state.play_audio)) { state.config_dirty = true; }
 
         if (is_base(selected)) {
             ImGui::SeparatorText(tr(state.lang, "音色克隆参数", "Voice Clone"));
-            ImGui::InputText(tr(state.lang, "参考音频路径", "Reference Audio Path"), state.reference_audio, sizeof(state.reference_audio));
-            ImGui::InputText(tr(state.lang, "参考文本", "Reference Text"), state.reference_text_input, sizeof(state.reference_text_input));
-            ImGui::Checkbox(tr(state.lang, "无需参考文本", "No ref text"), &state.x_vector_only);
+            if (ImGui::InputText(tr(state.lang, "参考音频路径", "Reference Audio Path"), state.reference_audio, sizeof(state.reference_audio))) { state.config_dirty = true; }
+            if (ImGui::InputText(tr(state.lang, "参考文本", "Reference Text"), state.reference_text_input, sizeof(state.reference_text_input))) { state.config_dirty = true; }
+            if (ImGui::Checkbox(tr(state.lang, "无需参考文本", "No ref text"), &state.x_vector_only)) { state.config_dirty = true; }
         }
 
         if (is_custom(selected)) {
@@ -1460,39 +1583,39 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             for (const auto &x : k_speakers) {
                 sp.push_back(state.lang == ui_lang::zh ? x.name_zh : x.name_en);
             }
-            ImGui::Combo(tr(state.lang, "声音", "Voice"), &state.speaker_index, sp.data(), (int)sp.size());
+            if (ImGui::Combo(tr(state.lang, "声音", "Voice"), &state.speaker_index, sp.data(), (int)sp.size())) { state.config_dirty = true; }
             if (is_custom_17b(selected)) {
-                ImGui::InputText(tr(state.lang, "风格描述（可选）", "Style Prompt (Optional)"), state.instruct_input, sizeof(state.instruct_input));
+                if (ImGui::InputText(tr(state.lang, "风格描述（可选）", "Style Prompt (Optional)"), state.instruct_input, sizeof(state.instruct_input))) { state.config_dirty = true; }
             }
         }
 
         if (is_design(selected)) {
             ImGui::SeparatorText(tr(state.lang, "音色设计参数", "Voice Design"));
-            ImGui::InputText(tr(state.lang, "风格描述", "Style Prompt"), state.instruct_input, sizeof(state.instruct_input));
+            if (ImGui::InputText(tr(state.lang, "风格描述", "Style Prompt"), state.instruct_input, sizeof(state.instruct_input))) { state.config_dirty = true; }
         }
 
         ImGui::SeparatorText(tr(state.lang, "输出", "Output"));
-        ImGui::Checkbox(tr(state.lang, "保存到文件", "Save to File"), &state.save_output);
+        if (ImGui::Checkbox(tr(state.lang, "保存到文件", "Save to File"), &state.save_output)) { state.config_dirty = true; }
         if (state.save_output) {
-            ImGui::InputText(tr(state.lang, "输出文件", "Output File"), state.output_path, sizeof(state.output_path));
+            if (ImGui::InputText(tr(state.lang, "输出文件", "Output File"), state.output_path, sizeof(state.output_path))) { state.config_dirty = true; }
         }
 
         if (ImGui::CollapsingHeader(tr(state.lang, "高级参数", "Advanced"))) {
-            ImGui::SliderFloat(tr(state.lang, "温度", "Temperature"), &state.temperature, 0.0f, 2.0f, "%.2f");
-            ImGui::SliderInt("Top-k", &state.top_k, 0, 200);
-            ImGui::SliderFloat("Top-p", &state.top_p, 0.0f, 1.0f, "%.2f");
-            ImGui::SliderInt(tr(state.lang, "最大 Token", "Max Tokens"), &state.max_tokens, 32, 8192);
-            ImGui::SliderFloat(tr(state.lang, "重复惩罚", "Repetition Penalty"), &state.repetition_penalty, 1.0f, 2.0f, "%.2f");
-            ImGui::InputInt("Seed", &state.seed);
-            ImGui::InputInt(tr(state.lang, "线程数", "Threads"), &state.threads);
+            if (ImGui::SliderFloat(tr(state.lang, "温度", "Temperature"), &state.temperature, 0.0f, 2.0f, "%.2f")) { state.config_dirty = true; }
+            if (ImGui::SliderInt("Top-k", &state.top_k, 0, 200)) { state.config_dirty = true; }
+            if (ImGui::SliderFloat("Top-p", &state.top_p, 0.0f, 1.0f, "%.2f")) { state.config_dirty = true; }
+            if (ImGui::SliderInt(tr(state.lang, "最大 Token", "Max Tokens"), &state.max_tokens, 32, 8192)) { state.config_dirty = true; }
+            if (ImGui::SliderFloat(tr(state.lang, "重复惩罚", "Repetition Penalty"), &state.repetition_penalty, 1.0f, 2.0f, "%.2f")) { state.config_dirty = true; }
+            if (ImGui::InputInt("Seed", &state.seed)) { state.config_dirty = true; }
+            if (ImGui::InputInt(tr(state.lang, "线程数", "Threads"), &state.threads)) { state.config_dirty = true; }
             if (state.threads < 1) state.threads = 1;
         }
 
         if (state.generation_running) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
-            if (ImGui::Button(tr(state.lang, "终止", "Terminate"), ImVec2(180, 42))) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.25f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
+            if (ImGui::Button(tr(state.lang, "停止", "Stop"), ImVec2(180, 42))) {
                 state.cancel_requested = true;
             }
             ImGui::PopStyleColor(3);
@@ -1529,22 +1652,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         if (state.generation_running) {
             float progress = (float)state.progress_percent / 100.0f;
-            if (state.segment_total <= 1) {
-                static float indeterminate = 0.0f;
-                indeterminate += ImGui::GetIO().DeltaTime * 0.5f;
-                if (indeterminate > 1.0f) indeterminate = 0.0f;
-                ImGui::ProgressBar(indeterminate, ImVec2(-1.0f, 0), "");
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", tr(state.lang, "处理中...", "Processing..."));
-            } else {
-                char label[64];
-                snprintf(label, sizeof(label), "%s %d/%d",
+            progress = (progress < 0.0f) ? 0.0f : (progress > 1.0f) ? 1.0f : progress;
+            char label[96];
+            if (state.segment_total > 1) {
+                snprintf(label, sizeof(label), "%s %d/%d  %d%%",
                     state.lang == ui_lang::zh ? "段" : "seg",
-                    (int)state.segment_completed, (int)state.segment_total);
-                ImGui::ProgressBar(progress, ImVec2(-1.0f, 0), label);
-                ImGui::SameLine();
-                ImGui::Text("%d%%", (int)state.progress_percent);
+                    (int)state.segment_completed, (int)state.segment_total,
+                    (int)state.progress_percent);
+            } else {
+                snprintf(label, sizeof(label), "%d%%", (int)state.progress_percent);
             }
+            ImGui::ProgressBar(progress, ImVec2(-1.0f, 0), label);
         }
 
         ImGui::SeparatorText(tr(state.lang, "日志", "Logs"));
@@ -1559,6 +1677,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::EndChild();
 
         ImGui::End();
+
+        // Auto-save config when parameters change
+        if (state.config_dirty && !state.generation_running) {
+            state.config_dirty = false;
+            save_config(state, save_config_path());
+        }
 
         ImGui::Render();
         const float clear_color[4] = {0.06f, 0.07f, 0.09f, 1.00f};

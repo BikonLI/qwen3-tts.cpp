@@ -37,6 +37,8 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+test.py
+videos/
 
 # OS
 .DS_Store
@@ -51,6 +53,7 @@ debug_*.bin
 reference/decoder_debug/
 reference/debug/
 imgui.ini
+gui_config.ini
 
 # submodules
 ggml/

@@ -1019,18 +1019,24 @@ namespace qwen3_tts {
             generation_speaker_embedding = nullptr;
         }
 
-        std::vector<int32_t> speech_codes;
+std::vector<int32_t> speech_codes;
+        auto synth_frame_cb = [&](const int32_t * /*frame_codes*/, int32_t /*n_codebooks*/, int32_t frame_index) -> bool {
+            if (progress_callback_) {
+                progress_callback_(frame_index + 1, params.max_audio_tokens);
+            }
+            return true;
+        };
         if (!transformer_->generate(
             text_tokens.data(), (int32_t)text_tokens.size(), generation_speaker_embedding,
             params.max_audio_tokens,
             speech_codes, effective_language_id, speaker_codec_id,
             params.repetition_penalty, params.temperature, params.top_k,
                 params.top_p,
-                instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
-                (int32_t)instruct_tokens.size(),
-                nullptr,
-                params.seed
-            )) {
+            instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+            (int32_t)instruct_tokens.size(),
+            progress_callback_ ? synth_frame_cb : TTSTransformer::generate_frame_callback_t{},
+            params.seed
+        )) {
             if (cancel_requested_.load()) {
                 result.error_msg = "generation cancelled";
                 return result;

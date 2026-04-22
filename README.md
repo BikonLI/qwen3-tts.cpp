@@ -14,6 +14,7 @@
     <a href="#windows-build">Windows 构建</a> ·
     <a href="#artifacts">产物说明</a> ·
     <a href="#cli">CLI 示例</a> ·
+    <a href="#gui">GUI 使用</a> ·
     <a href="#integration">DLL 与 C++ 集成</a>
   </p>
 </div>
@@ -47,6 +48,20 @@ qwen3-tts.cpp 是面向真实部署场景打造的 Qwen3-TTS C++ 全链路实现
     <td width="33%" valign="top">
       <h3>全链路部署</h3>
       <p>Tokenizer、Speaker Encoder、Transformer、Vocoder 纯 C++17 推理。</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <h3>流式输出</h3>
+      <p>流式推理，实时音频输出，低延迟。</p>
+    </td>
+    <td width="33%" valign="top">
+      <h3>GUI 界面</h3>
+      <p>Windows 原生 GUI，Win32 + DX11 + ImGui，开箱即用。</p>
+    </td>
+    <td width="33%" valign="top">
+      <h3>长文本支持</h3>
+      <p>GUI 支持无限长文本自动分段，无惧超长内容。</p>
     </td>
   </tr>
 </table>
@@ -190,6 +205,7 @@ cmake --install build --config Release --prefix dist
 - build/Release/qwen3tts.dll
 - build/Release/qwen3tts.lib
 - build/Release/qwen3-tts-cli.exe
+- build/Release/qwen3-tts-gui.exe
 
 <table>
   <tr>
@@ -211,6 +227,11 @@ cmake --install build --config Release --prefix dist
     <td>qwen3-tts-cli.exe</td>
     <td>命令行工具</td>
     <td>开箱即用，适合验证模型、批处理生成和集成测试。</td>
+  </tr>
+  <tr>
+    <td>qwen3-tts-gui.exe</td>
+    <td>图形界面工具</td>
+    <td>Windows 原生 GUI，支持流式输出、长文本自动分段生成。</td>
   </tr>
 </table>
 
@@ -276,6 +297,50 @@ cmake --install build --config Release --prefix dist
 
 </details>
 
+<a id="gui"></a>
+
+## GUI 快速上手
+
+GUI 界面基于 Windows 原生开发（Win32 + DX11 + ImGui），提供直观友好的交互体验。
+
+### 核心功能
+
+- **流式输出**：实时音频流输出，边生成边播放
+- **长文本自动分段**：超长文本智能拆分，自动续接生成无限长语音
+- **多种模型支持**：0.6B / 1.7B，Base / CustomVoice / VoiceDesign
+- **可视化参数调节**：温度、top-p、top-k、seed 等参数实时调整
+
+### 启动方式
+
+```powershell
+.\build\Release\qwen3-tts-gui.exe
+```
+
+首次运行需在设置中选择模型目录，GUI 会自动加载可用模型。
+
+### 使用流程
+
+1. **选择模型**：在模型下拉框中选择要使用的模型（Base / CustomVoice / VoiceDesign）
+2. **选择音色**：选择预置音色（CustomVoice/VoiceDesign）或提供参考音频克隆（Base）
+3. **输入文本**：在文本框中输入要合成的内容
+4. **生成**：点击生成按钮，流式输出实时播放；长文本自动分段处理
+
+### 流式输出说明
+
+GUI 默认启用流式输出模式：
+
+- 音频在生成时即时输出，无需等待完整文本处理完成
+- 播放器实时播放当前可用音频片段
+- 进度条显示当前生成进度
+
+### 长文本分段策略
+
+当输入文本超过单次生成上限时，GUI 自动：
+
+1. 按照标点符号和句子边界智能拆分文本
+2. 依次生成各分段并平滑续接
+3. 最终合并为完整音频输出
+
 <a id="integration"></a>
 
 ## DLL 与 C++ 集成
@@ -321,11 +386,12 @@ int main() {
 
 ## 为什么它是最完整的 Qwen3-TTS C++ 部署方案
 
-- 一套工程同时覆盖 CLI、C API、C++ API 三种接入层。
+- 一套工程同时覆盖 CLI、GUI、C API、C++ API 四种接入层。
 - 一套权重体系覆盖 Base、CustomVoice、VoiceDesign 全任务族。
-- 一套构建配置直接产出 DLL + LIB + EXE，部署结构清晰。
+- 一套构建配置直接产出 DLL + LIB + CLI + GUI，部署结构清晰。
 - 一套核心代码完成 tokenizer、speaker encoder、transformer、vocoder 全链路推理。
 - 一套 Windows 优先的工程实践，真正对部署友好。
+- 流式输出 + 长文本自动分段，真正可用的生产级方案。
 
 一句话总结：
 

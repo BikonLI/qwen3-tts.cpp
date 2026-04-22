@@ -647,6 +647,7 @@ struct app_state {
     std::atomic<int> segment_completed{0};
     std::atomic<int> progress_percent{0};
     std::atomic<bool> cancel_requested{false};
+    std::atomic<bool> stopping{false};
 
     bool config_dirty = false;
 };
@@ -831,6 +832,34 @@ static void reset_state_to_defaults(app_state &state) {
     state.config_dirty = true;
 }
 
+static std::string escape_string(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\n') { out += "\\n"; }
+        else if (c == '\r') { out += "\\r"; }
+        else if (c == '\\') { out += "\\\\"; }
+        else { out += c; }
+    }
+    return out;
+}
+
+static std::string unescape_string(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            if (s[i + 1] == 'n') { out += '\n'; ++i; }
+            else if (s[i + 1] == 'r') { out += '\r'; ++i; }
+            else if (s[i + 1] == '\\') { out += '\\'; ++i; }
+            else { out += s[i]; }
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
 bool save_config(const app_state &state, const std::string &path) {
     std::ofstream out(path, std::ios::out | std::ios::trunc);
     if (!out.is_open()) return false;
@@ -839,11 +868,11 @@ bool save_config(const app_state &state, const std::string &path) {
     out << "speaker_index=" << state.speaker_index << "\n";
     out << "synthesis_language_index=" << state.synthesis_language_index << "\n";
 
-    out << "text_input=" << state.text_input << "\n";
-    out << "reference_audio=" << state.reference_audio << "\n";
-    out << "reference_text_input=" << state.reference_text_input << "\n";
-    out << "instruct_input=" << state.instruct_input << "\n";
-    out << "output_path=" << state.output_path << "\n";
+    out << "text_input=" << escape_string(state.text_input) << "\n";
+    out << "reference_audio=" << escape_string(state.reference_audio) << "\n";
+    out << "reference_text_input=" << escape_string(state.reference_text_input) << "\n";
+    out << "instruct_input=" << escape_string(state.instruct_input) << "\n";
+    out << "output_path=" << escape_string(state.output_path) << "\n";
 
     out << "x_vector_only=" << (state.x_vector_only ? 1 : 0) << "\n";
     out << "save_output=" << (state.save_output ? 1 : 0) << "\n";
@@ -900,15 +929,15 @@ bool load_config(app_state &state, const std::string &path) {
         } else if (key == "synthesis_language_index") {
             if (!parse_int(value, state.synthesis_language_index)) return false;
         } else if (key == "text_input") {
-            strncpy_s(state.text_input, value.c_str(), _TRUNCATE);
+            strncpy_s(state.text_input, unescape_string(value).c_str(), _TRUNCATE);
         } else if (key == "reference_audio") {
-            strncpy_s(state.reference_audio, value.c_str(), _TRUNCATE);
+            strncpy_s(state.reference_audio, unescape_string(value).c_str(), _TRUNCATE);
         } else if (key == "reference_text_input") {
-            strncpy_s(state.reference_text_input, value.c_str(), _TRUNCATE);
+            strncpy_s(state.reference_text_input, unescape_string(value).c_str(), _TRUNCATE);
         } else if (key == "instruct_input") {
-            strncpy_s(state.instruct_input, value.c_str(), _TRUNCATE);
+            strncpy_s(state.instruct_input, unescape_string(value).c_str(), _TRUNCATE);
         } else if (key == "output_path") {
-            strncpy_s(state.output_path, value.c_str(), _TRUNCATE);
+            strncpy_s(state.output_path, unescape_string(value).c_str(), _TRUNCATE);
         } else if (key == "x_vector_only") {
             if (!parse_int(value, int_value)) return false;
             state.x_vector_only = (bool)int_value;
@@ -969,11 +998,7 @@ static bool run_stream_session(
         // Check for cancellation before polling
         if (state.cancel_requested.load()) {
             session->cancel();
-            // Drain remaining audio quickly without playback
-            qwen3_tts::tts_audio_chunk drain_chunk;
-            while (session->poll(drain_chunk, 10) == qwen3_tts::tts_stream_poll_status::chunk) {
-                // Just drain, don't play
-            }
+            if (playback_enabled) { player.cancel(); }
             error_msg = "cancelled";
             return false;
         }
@@ -1611,12 +1636,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (state.threads < 1) state.threads = 1;
         }
 
-        if (state.generation_running) {
+        if (state.stopping.load()) {
+            // Stopping phase: gray disabled button
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+            ImGui::Button(tr(state.lang, "停止中...", "Stopping..."), ImVec2(180, 42));
+            ImGui::PopStyleColor(4);
+        } else if (state.generation_running) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.15f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.25f, 0.25f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
             if (ImGui::Button(tr(state.lang, "停止", "Stop"), ImVec2(180, 42))) {
                 state.cancel_requested = true;
+                state.stopping = true;
             }
             ImGui::PopStyleColor(3);
         } else {
@@ -1624,6 +1658,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (!can_generate) ImGui::BeginDisabled();
             if (ImGui::Button(tr(state.lang, "开始生成", "Generate"), ImVec2(180, 42))) {
                 state.cancel_requested = false;
+                state.stopping = false;
                 state.segment_completed = 0;
                 state.progress_percent = 0;
                 validate_or_set_popup(state, selected, state.save_output, state.output_path);
@@ -1631,6 +1666,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     state.generation_running = true;
                     state.generation_thread = std::thread([&state, selected]() {
                         run_generation(state, selected);
+                        state.cancel_requested = false;
+                        state.stopping = false;
                         state.generation_running = false;
                     });
                 }
@@ -1650,7 +1687,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::EndPopup();
         }
 
-        if (state.generation_running) {
+        if (state.generation_running || state.stopping.load()) {
             float progress = (float)state.progress_percent / 100.0f;
             progress = (progress < 0.0f) ? 0.0f : (progress > 1.0f) ? 1.0f : progress;
             char label[96];

@@ -30,6 +30,7 @@ third_party/
 .idea/
 *.swp
 *.swo
+.opencode/
 
 # Python
 __pycache__/

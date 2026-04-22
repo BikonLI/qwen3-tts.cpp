@@ -2909,6 +2909,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> embd_row(cfg.hidden_size);
     
     for (int frame = 0; frame < max_len; ++frame) {
+        if (cancel_flag_ && cancel_flag_->load()) {
+            error_msg_ = "generation cancelled";
+            return false;
+        }
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
             if (i != cfg.codec_eos_id) {
@@ -3142,6 +3146,10 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
 
     return true;
+}
+
+void TTSTransformer::set_cancel_flag(const std::atomic<bool> *cancel_flag) {
+    cancel_flag_ = cancel_flag;
 }
 
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,

@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -258,6 +259,7 @@ namespace qwen3_tts
         bool has_error() const;
         std::string get_error() const;
         int32_t dropped_chunks() const;
+        void cancel();
 
     private:
         explicit tts_stream_session(const std::shared_ptr<impl> &impl_ptr);
@@ -321,6 +323,9 @@ namespace qwen3_tts
 
         // Set progress callback
         void set_progress_callback(tts_progress_callback_t callback);
+
+        void request_cancel();
+        bool is_cancelled() const;
 
         // Stream synthesis (whole text input + chunked audio output).
         std::shared_ptr<tts_stream_session> synthesize_stream(
@@ -392,6 +397,7 @@ namespace qwen3_tts
         std::string tts_model_path_;
         std::string decoder_model_path_;
         tts_progress_callback_t progress_callback_;
+        std::atomic<bool> cancel_requested_{false};
         mutable std::mutex stream_mutex_;
         bool stream_active_ = false;
         std::shared_ptr<tts_stream_session::impl> stream_impl_;

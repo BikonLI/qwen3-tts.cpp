@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -137,6 +138,286 @@ static bool load_text_or_file(const std::string &input, std::string &out_text) {
     fclose(f);
     out_text = std::move(content);
     return true;
+}
+
+struct text_segment {
+    std::string text;
+    int word_unit_count;
+};
+
+static size_t utf8_len(char c) {
+    const unsigned char uc = (unsigned char)c;
+    if ((uc & 0x80u) == 0) return 1;
+    if ((uc & 0xE0u) == 0xC0u) return 2;
+    if ((uc & 0xF0u) == 0xE0u) return 3;
+    if ((uc & 0xF8u) == 0xF0u) return 4;
+    return 1;
+}
+
+static size_t utf8_decode(const std::string &text, size_t offset, uint32_t &codepoint) {
+    if (offset >= text.size()) {
+        codepoint = 0;
+        return 0;
+    }
+
+    const unsigned char lead = (unsigned char)text[offset];
+    size_t len = utf8_len((char)lead);
+    if (offset + len > text.size()) {
+        codepoint = lead;
+        return 1;
+    }
+
+    if (len == 1) {
+        codepoint = lead;
+        return 1;
+    }
+
+    for (size_t i = 1; i < len; ++i) {
+        const unsigned char uc = (unsigned char)text[offset + i];
+        if ((uc & 0xC0u) != 0x80u) {
+            codepoint = lead;
+            return 1;
+        }
+    }
+
+    if (len == 2) {
+        codepoint = ((uint32_t)(lead & 0x1Fu) << 6) | (uint32_t)(text[offset + 1] & 0x3Fu);
+    } else if (len == 3) {
+        codepoint = ((uint32_t)(lead & 0x0Fu) << 12)
+            | ((uint32_t)(text[offset + 1] & 0x3Fu) << 6)
+            | (uint32_t)(text[offset + 2] & 0x3Fu);
+    } else {
+        codepoint = ((uint32_t)(lead & 0x07u) << 18)
+            | ((uint32_t)(text[offset + 1] & 0x3Fu) << 12)
+            | ((uint32_t)(text[offset + 2] & 0x3Fu) << 6)
+            | (uint32_t)(text[offset + 3] & 0x3Fu);
+    }
+
+    return len;
+}
+
+static bool is_cjk_ideograph(uint32_t cp) {
+    return (cp >= 0x4E00u && cp <= 0x9FFFu) || (cp >= 0x3400u && cp <= 0x4DBFu);
+}
+
+static bool is_cjk_punct(uint32_t cp) {
+    return cp >= 0x3000u && cp <= 0x303Fu;
+}
+
+static bool is_latin_word_char(uint32_t cp) {
+    return cp <= 0x7Fu && std::isalnum((unsigned char)cp);
+}
+
+static bool is_whitespace(uint32_t cp) {
+    if (cp <= 0x7Fu) {
+        return std::isspace((unsigned char)cp) != 0;
+    }
+    return cp == 0x3000u;
+}
+
+static bool is_cjk_sentence_punct(uint32_t cp) {
+    switch (cp) {
+        case 0x3002u: // 。
+        case 0xFF01u: // ！
+        case 0xFF1Fu: // ？
+        case 0xFF1Bu: // ；
+        case 0x2026u: // …
+        case 0x3001u: // 、
+        case 0x300Au: // 《
+        case 0x300Bu: // 》
+        case 0x3010u: // 【
+        case 0x3011u: // 】
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_latin_sentence_punct(uint32_t cp) {
+    switch (cp) {
+        case '.':
+        case '!':
+        case '?':
+        case ';':
+        case ':':
+        case 0x2014u: // —
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_secondary_break(uint32_t cp) {
+    switch (cp) {
+        case ',':
+        case ';':
+        case 0xFF0Cu: // ，
+        case 0xFF1Bu: // ；
+        case 0x3001u: // 、
+            return true;
+        default:
+            return false;
+    }
+}
+
+struct text_symbol {
+    size_t byte_pos;
+    size_t byte_len;
+    uint32_t codepoint;
+    bool cjk_ideograph;
+    bool cjk_punct;
+    bool latin_word;
+    bool whitespace;
+    bool primary_break;
+    bool secondary_break;
+};
+
+static std::vector<text_segment> segment_text(const std::string &input, int max_units = 80) {
+    std::vector<text_segment> segments;
+    if (input.empty()) return segments;
+
+    if (max_units <= 0) {
+        int units = 0;
+        bool in_word = false;
+        size_t i = 0;
+        while (i < input.size()) {
+            uint32_t cp = 0;
+            size_t len = utf8_decode(input, i, cp);
+            if (len == 0) break;
+            if (is_cjk_ideograph(cp)) {
+                units += 1;
+                in_word = false;
+            } else if (is_latin_word_char(cp)) {
+                if (!in_word) {
+                    units += 1;
+                    in_word = true;
+                }
+            } else {
+                in_word = false;
+            }
+            i += len;
+        }
+        segments.push_back({input, units});
+        return segments;
+    }
+
+    std::vector<text_symbol> symbols;
+    symbols.reserve(input.size());
+    size_t offset = 0;
+    while (offset < input.size()) {
+        uint32_t cp = 0;
+        size_t len = utf8_decode(input, offset, cp);
+        if (len == 0) break;
+        text_symbol sym{};
+        sym.byte_pos = offset;
+        sym.byte_len = len;
+        sym.codepoint = cp;
+        sym.cjk_ideograph = is_cjk_ideograph(cp);
+        sym.cjk_punct = is_cjk_punct(cp);
+        sym.latin_word = is_latin_word_char(cp);
+        sym.whitespace = is_whitespace(cp);
+        sym.primary_break = is_cjk_sentence_punct(cp) || is_latin_sentence_punct(cp);
+        sym.secondary_break = is_secondary_break(cp);
+        symbols.push_back(sym);
+        offset += len;
+    }
+
+    if (symbols.empty()) return segments;
+
+    const int extra_units = (max_units * 3) / 10;
+    size_t start_index = 0;
+    while (start_index < symbols.size()) {
+        int units = 0;
+        bool in_word = false;
+        size_t index = start_index;
+        bool reached_limit = false;
+        for (; index < symbols.size(); ++index) {
+            const text_symbol &sym = symbols[index];
+            if (sym.cjk_ideograph) {
+                units += 1;
+                in_word = false;
+            } else if (sym.latin_word) {
+                if (!in_word) {
+                    units += 1;
+                    in_word = true;
+                }
+            } else {
+                in_word = false;
+            }
+
+            if (units >= max_units) {
+                reached_limit = true;
+                break;
+            }
+        }
+
+        if (!reached_limit || index >= symbols.size()) {
+            const text_symbol &last = symbols.back();
+            size_t start_byte = symbols[start_index].byte_pos;
+            size_t end_byte = last.byte_pos + last.byte_len;
+            segments.push_back({input.substr(start_byte, end_byte - start_byte), units});
+            break;
+        }
+
+        size_t segment_end = index;
+        int segment_units = units;
+
+        size_t primary_break = symbols.size();
+        size_t secondary_break = symbols.size();
+        int primary_units = 0;
+        int secondary_units = 0;
+        int scan_units = units;
+        bool scan_in_word = in_word;
+        const int limit_units = max_units + extra_units;
+
+        for (size_t scan_index = index; scan_index < symbols.size(); ++scan_index) {
+            if (scan_index > index) {
+                const text_symbol &scan_sym = symbols[scan_index];
+                if (scan_sym.cjk_ideograph) {
+                    scan_units += 1;
+                    scan_in_word = false;
+                } else if (scan_sym.latin_word) {
+                    if (!scan_in_word) {
+                        scan_units += 1;
+                        scan_in_word = true;
+                    }
+                } else {
+                    scan_in_word = false;
+                }
+                if (scan_units > limit_units) {
+                    break;
+                }
+            }
+
+            const text_symbol &scan_sym = symbols[scan_index];
+            if (scan_sym.primary_break) {
+                primary_break = scan_index;
+                primary_units = scan_units;
+                break;
+            }
+            if (secondary_break == symbols.size() && scan_sym.secondary_break) {
+                secondary_break = scan_index;
+                secondary_units = scan_units;
+            }
+        }
+
+        if (primary_break != symbols.size()) {
+            segment_end = primary_break;
+            segment_units = primary_units;
+        } else if (secondary_break != symbols.size()) {
+            segment_end = secondary_break;
+            segment_units = secondary_units;
+        }
+
+        const text_symbol &end_sym = symbols[segment_end];
+        size_t start_byte = symbols[start_index].byte_pos;
+        size_t end_byte = end_sym.byte_pos + end_sym.byte_len;
+        segments.push_back({input.substr(start_byte, end_byte - start_byte), segment_units});
+
+        start_index = segment_end + 1;
+    }
+
+    return segments;
 }
 
 class WavStreamWriter {
@@ -326,6 +607,11 @@ struct app_state {
 
     bool request_validation_popup = false;
     std::string validation_message;
+    
+    std::atomic<int> segment_total{0};
+    std::atomic<int> segment_completed{0};
+    std::atomic<int> progress_percent{0};
+    std::atomic<bool> cancel_requested{false};
 };
 
 struct synthesis_language_option {
@@ -476,8 +762,129 @@ static bool is_custom_17b(model_id id) {
     return id == model_id::model_17b_custom;
 }
 
+static std::string save_config_path() {
+    return (fs::current_path() / "gui_config.ini").string();
+}
+
 static std::string save_file_default() {
     return (fs::current_path() / "outputs" / "tts_output.wav").string();
+}
+
+bool save_config(const app_state &state, const std::string &path) {
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) return false;
+
+    out << "model_index=" << state.model_index << "\n";
+    out << "speaker_index=" << state.speaker_index << "\n";
+    out << "synthesis_language_index=" << state.synthesis_language_index << "\n";
+
+    out << "text_input=" << state.text_input << "\n";
+    out << "reference_audio=" << state.reference_audio << "\n";
+    out << "reference_text_input=" << state.reference_text_input << "\n";
+    out << "instruct_input=" << state.instruct_input << "\n";
+    out << "output_path=" << state.output_path << "\n";
+
+    out << "x_vector_only=" << (state.x_vector_only ? 1 : 0) << "\n";
+    out << "save_output=" << (state.save_output ? 1 : 0) << "\n";
+    out << "play_audio=" << (state.play_audio ? 1 : 0) << "\n";
+    out << "stream=" << (state.stream ? 1 : 0) << "\n";
+    out << "stream_realtime=" << (state.stream_realtime ? 1 : 0) << "\n";
+
+    out << "temperature=" << std::to_string(state.temperature) << "\n";
+    out << "top_k=" << state.top_k << "\n";
+    out << "top_p=" << std::to_string(state.top_p) << "\n";
+    out << "max_tokens=" << state.max_tokens << "\n";
+    out << "repetition_penalty=" << std::to_string(state.repetition_penalty) << "\n";
+    out << "seed=" << state.seed << "\n";
+    out << "threads=" << state.threads << "\n";
+
+    return out.good();
+}
+
+bool load_config(app_state &state, const std::string &path) {
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+
+    const auto parse_int = [](const std::string &s, int &out) -> bool {
+        char *end = nullptr;
+        const long v = std::strtol(s.c_str(), &end, 10);
+        if (end == s.c_str() || *end != '\0') return false;
+        out = (int)v;
+        return true;
+    };
+
+    const auto parse_float = [](const std::string &s, float &out) -> bool {
+        char *end = nullptr;
+        const float v = std::strtof(s.c_str(), &end);
+        if (end == s.c_str() || *end != '\0') return false;
+        out = v;
+        return true;
+    };
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t sep = line.find('=');
+        if (sep == std::string::npos) continue;
+
+        std::string key = line.substr(0, sep);
+        std::string value = line.substr(sep + 1);
+        if (!value.empty() && value.back() == '\r') value.pop_back();
+
+        int int_value = 0;
+        float float_value = 0.0f;
+        if (key == "model_index") {
+            if (!parse_int(value, state.model_index)) return false;
+        } else if (key == "speaker_index") {
+            if (!parse_int(value, state.speaker_index)) return false;
+        } else if (key == "synthesis_language_index") {
+            if (!parse_int(value, state.synthesis_language_index)) return false;
+        } else if (key == "text_input") {
+            strncpy_s(state.text_input, value.c_str(), _TRUNCATE);
+        } else if (key == "reference_audio") {
+            strncpy_s(state.reference_audio, value.c_str(), _TRUNCATE);
+        } else if (key == "reference_text_input") {
+            strncpy_s(state.reference_text_input, value.c_str(), _TRUNCATE);
+        } else if (key == "instruct_input") {
+            strncpy_s(state.instruct_input, value.c_str(), _TRUNCATE);
+        } else if (key == "output_path") {
+            strncpy_s(state.output_path, value.c_str(), _TRUNCATE);
+        } else if (key == "x_vector_only") {
+            if (!parse_int(value, int_value)) return false;
+            state.x_vector_only = (bool)int_value;
+        } else if (key == "save_output") {
+            if (!parse_int(value, int_value)) return false;
+            state.save_output = (bool)int_value;
+        } else if (key == "play_audio") {
+            if (!parse_int(value, int_value)) return false;
+            state.play_audio = (bool)int_value;
+        } else if (key == "stream") {
+            if (!parse_int(value, int_value)) return false;
+            state.stream = (bool)int_value;
+        } else if (key == "stream_realtime") {
+            if (!parse_int(value, int_value)) return false;
+            state.stream_realtime = (bool)int_value;
+        } else if (key == "temperature") {
+            if (!parse_float(value, float_value)) return false;
+            state.temperature = float_value;
+        } else if (key == "top_k") {
+            if (!parse_int(value, state.top_k)) return false;
+        } else if (key == "top_p") {
+            if (!parse_float(value, float_value)) return false;
+            state.top_p = float_value;
+        } else if (key == "max_tokens") {
+            if (!parse_int(value, state.max_tokens)) return false;
+        } else if (key == "repetition_penalty") {
+            if (!parse_float(value, float_value)) return false;
+            state.repetition_penalty = float_value;
+        } else if (key == "seed") {
+            if (!parse_int(value, state.seed)) return false;
+        } else if (key == "threads") {
+            if (!parse_int(value, state.threads)) return false;
+        }
+    }
+
+    if (state.threads < 1) state.threads = 1;
+    return true;
 }
 
 static bool run_stream_session(
@@ -669,7 +1076,7 @@ static void validate_or_set_popup(app_state &state, model_id selected, bool save
             return;
         }
         if (!state.x_vector_only && std::string(state.reference_text_input).empty()) {
-            state.validation_message = tr(state.lang, "请填写参考文本，或开启 x-vector-only。", "Please provide reference text, or enable x-vector-only.");
+            state.validation_message = tr(state.lang, "请填写参考文本，或开启无需参考文本。", "Please provide reference text, or enable No ref text.");
             state.request_validation_popup = true;
             return;
         }
@@ -717,6 +1124,22 @@ static void run_generation(app_state &state, model_id selected) {
         return;
     }
 
+    const auto segments = segment_text(text, 80);
+    state.segment_total = (int)segments.size();
+    state.segment_completed = 0;
+    state.progress_percent = 0;
+
+    if (segments.empty()) {
+        append_log(state, "[error] text segmentation produced no segments");
+        return;
+    }
+
+    if (segments.size() == 1) {
+        append_log(state, "[run] single segment, generating...");
+    } else {
+        append_log(state, "[run] text split into " + std::to_string(segments.size()) + " segments");
+    }
+
     qwen3_tts::tts_params params;
     params.temperature = state.temperature;
     params.top_k = state.top_k;
@@ -751,72 +1174,116 @@ static void run_generation(app_state &state, model_id selected) {
     const std::string output = state.save_output ? std::string(state.output_path) : std::string();
 
     if (state.stream) {
-        qwen3_tts::tts_stream_params stream_params;
-        stream_params.tts = params;
-        if (state.stream_realtime) {
-            stream_params.stream_chunk_frames = std::max(stream_params.stream_chunk_frames, 16);
-            stream_params.stream_decoder_left_context_frames = 1;
-            stream_params.stream_decoder_lookahead_frames = 2;
-            stream_params.stream_queue_capacity = std::max(stream_params.stream_queue_capacity, 24);
-        }
+        for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
+            if (state.cancel_requested.load()) {
+                append_log(state, "[cancelled] stream generation stopped");
+                break;
+            }
 
-        std::shared_ptr<qwen3_tts::tts_stream_session> session;
-        if (is_base(selected)) {
-            stream_params.tts.task_type = qwen3_tts::tts_task_type::voice_clone;
-            stream_params.tts.reference_text = ref_text;
-            session = tts.synthesize_with_voice_stream(text, std::string(state.reference_audio), stream_params);
-        } else if (is_custom(selected)) {
-            stream_params.tts.task_type = qwen3_tts::tts_task_type::custom_voice;
-            stream_params.tts.speaker = k_speakers[state.speaker_index].id;
-            stream_params.tts.instruct = is_custom_17b(selected) ? instruct : std::string();
-            session = tts.synthesize_stream(text, stream_params);
-        } else {
-            stream_params.tts.task_type = qwen3_tts::tts_task_type::voice_design;
-            stream_params.tts.instruct = instruct;
-            session = tts.synthesize_stream(text, stream_params);
+            append_log(state, "[run] segment " + std::to_string(seg_idx + 1) + "/" + std::to_string(segments.size()));
+
+            qwen3_tts::tts_stream_params stream_params;
+            stream_params.tts = params;
+            if (state.stream_realtime) {
+                stream_params.stream_chunk_frames = std::max(stream_params.stream_chunk_frames, 16);
+                stream_params.stream_decoder_left_context_frames = 1;
+                stream_params.stream_decoder_lookahead_frames = 2;
+                stream_params.stream_queue_capacity = std::max(stream_params.stream_queue_capacity, 24);
+            }
+
+            tts.set_progress_callback([&](int tok, int max_tok) {
+                int seg_prog = (int)((seg_idx * 100 + (size_t)tok * 100 / (size_t)std::max(1, max_tok)) / segments.size());
+                state.progress_percent = seg_prog;
+            });
+
+            std::shared_ptr<qwen3_tts::tts_stream_session> session;
+            if (is_base(selected)) {
+                stream_params.tts.task_type = qwen3_tts::tts_task_type::voice_clone;
+                stream_params.tts.reference_text = ref_text;
+                session = tts.synthesize_with_voice_stream(segments[seg_idx].text, std::string(state.reference_audio), stream_params);
+            } else if (is_custom(selected)) {
+                stream_params.tts.task_type = qwen3_tts::tts_task_type::custom_voice;
+                stream_params.tts.speaker = k_speakers[state.speaker_index].id;
+                stream_params.tts.instruct = is_custom_17b(selected) ? instruct : std::string();
+                session = tts.synthesize_stream(segments[seg_idx].text, stream_params);
+            } else {
+                stream_params.tts.task_type = qwen3_tts::tts_task_type::voice_design;
+                stream_params.tts.instruct = instruct;
+                session = tts.synthesize_stream(segments[seg_idx].text, stream_params);
+            }
+            if (!session) {
+                append_log(state, "[error] " + tts.get_error());
+                return;
+            }
+            std::string err;
+            if (!run_stream_session(session, output, state.play_audio, err)) {
+                append_log(state, "[error] " + err);
+                return;
+            }
+
+            state.segment_completed = (int)seg_idx + 1;
+            state.progress_percent = (int)((seg_idx + 1) * 100 / segments.size());
         }
-        if (!session) {
-            append_log(state, "[error] " + tts.get_error());
-            return;
-        }
-        std::string err;
-        if (!run_stream_session(session, output, state.play_audio, err)) {
-            append_log(state, "[error] " + err);
-            return;
-        }
+        tts.set_progress_callback(nullptr);
         append_log(state, "[ok] stream generation done");
+        state.progress_percent = 0;
         return;
     }
 
-    qwen3_tts::tts_result result;
-    if (is_base(selected)) {
-        params.task_type = qwen3_tts::tts_task_type::voice_clone;
-        params.reference_text = ref_text;
-        result = tts.synthesize_with_voice(text, std::string(state.reference_audio), params);
-    } else if (is_custom(selected)) {
-        params.task_type = qwen3_tts::tts_task_type::custom_voice;
-        params.speaker = k_speakers[state.speaker_index].id;
-        params.instruct = is_custom_17b(selected) ? instruct : std::string();
-        result = tts.synthesize(text, params);
-    } else {
-        params.task_type = qwen3_tts::tts_task_type::voice_design;
-        params.instruct = instruct;
-        result = tts.synthesize(text, params);
+    std::vector<float> all_audio;
+    int32_t sample_rate = 24000;
+
+    for (size_t seg_idx = 0; seg_idx < segments.size(); ++seg_idx) {
+        if (state.cancel_requested.load()) {
+            append_log(state, "[cancelled] generation stopped");
+            break;
+        }
+
+        append_log(state, "[run] segment " + std::to_string(seg_idx + 1) + "/" + std::to_string(segments.size()));
+
+        qwen3_tts::tts_result result;
+        if (is_base(selected)) {
+            params.task_type = qwen3_tts::tts_task_type::voice_clone;
+            params.reference_text = ref_text;
+            result = tts.synthesize_with_voice(segments[seg_idx].text, std::string(state.reference_audio), params);
+        } else if (is_custom(selected)) {
+            params.task_type = qwen3_tts::tts_task_type::custom_voice;
+            params.speaker = k_speakers[state.speaker_index].id;
+            params.instruct = is_custom_17b(selected) ? instruct : std::string();
+            result = tts.synthesize(segments[seg_idx].text, params);
+        } else {
+            params.task_type = qwen3_tts::tts_task_type::voice_design;
+            params.instruct = instruct;
+            result = tts.synthesize(segments[seg_idx].text, params);
+        }
+
+        if (!result.success) {
+            append_log(state, "[error] " + result.error_msg);
+            return;
+        }
+
+        if (result.sample_rate > 0) sample_rate = result.sample_rate;
+        all_audio.insert(all_audio.end(), result.audio.begin(), result.audio.end());
+
+        state.segment_completed = (int)seg_idx + 1;
+        state.progress_percent = (int)((seg_idx + 1) * 100 / segments.size());
     }
 
-    if (!result.success) {
-        append_log(state, "[error] " + result.error_msg);
-        return;
+    if (!all_audio.empty()) {
+        if (state.save_output && !qwen3_tts::save_audio_file(output, all_audio, sample_rate)) {
+            append_log(state, "[error] save output failed");
+            state.progress_percent = 0;
+            return;
+        }
+        if (state.play_audio && !qwen3_tts::play_audio(all_audio, sample_rate)) {
+            append_log(state, "[error] playback failed");
+            state.progress_percent = 0;
+            return;
+        }
     }
-    if (state.save_output && !qwen3_tts::save_audio_file(output, result.audio, result.sample_rate)) {
-        append_log(state, "[error] save output failed");
-        return;
-    }
-    if (state.play_audio && !qwen3_tts::play_audio(result.audio, result.sample_rate)) {
-        append_log(state, "[error] playback failed");
-        return;
-    }
+
     append_log(state, "[ok] generation done");
+    state.progress_percent = 0;
 }
 
 static fs::path locate_repo_root() {
@@ -863,6 +1330,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     append_log(state, std::string("[cwd] ") + fs::current_path().string());
     strncpy_s(state.output_path, save_file_default().c_str(), _TRUNCATE);
 
+    const std::string config_path = save_config_path();
+    if (!fs::exists(config_path)) {
+        if (save_config(state, config_path)) {
+            append_log(state, tr(state.lang, "[ok] 已创建默认配置: ", "[ok] created default config: ") + config_path);
+        } else {
+            append_log(state, tr(state.lang, "[warn] 创建默认配置失败: ", "[warn] failed to create default config: ") + config_path);
+        }
+    }
+
     state.model_setup_running = true;
     state.model_setup_thread = std::thread([&state]() {
         const bool ok = ensure_models_layout(state);
@@ -904,6 +1380,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", tr(state.lang, "模型准备失败，请查看日志。", "Model setup failed. Check logs."));
         } else {
             ImGui::TextUnformatted(tr(state.lang, "内置模型已就绪", "Built-in models ready"));
+        }
+
+        if (ImGui::Button(tr(state.lang, "保存配置", "Save Config"))) {
+            if (save_config(state, save_config_path())) {
+                append_log(state, tr(state.lang, "[ok] 配置已保存", "[ok] config saved"));
+            } else {
+                append_log(state, tr(state.lang, "[error] 配置保存失败", "[error] failed to save config"));
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", tr(state.lang, "保存当前界面参数到 gui_config.ini", "Save current UI parameters to gui_config.ini"));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr(state.lang, "恢复配置", "Restore Config"))) {
+            if (load_config(state, save_config_path())) {
+                append_log(state, tr(state.lang, "[ok] 配置已恢复", "[ok] config restored"));
+            } else {
+                append_log(state, tr(state.lang, "[error] 配置恢复失败", "[error] failed to restore config"));
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", tr(state.lang, "从 gui_config.ini 恢复界面参数", "Restore UI parameters from gui_config.ini"));
         }
 
         model_id selected = (model_id)state.model_index;
@@ -953,7 +1451,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::SeparatorText(tr(state.lang, "音色克隆参数", "Voice Clone"));
             ImGui::InputText(tr(state.lang, "参考音频路径", "Reference Audio Path"), state.reference_audio, sizeof(state.reference_audio));
             ImGui::InputText(tr(state.lang, "参考文本", "Reference Text"), state.reference_text_input, sizeof(state.reference_text_input));
-            ImGui::Checkbox("x-vector-only", &state.x_vector_only);
+            ImGui::Checkbox(tr(state.lang, "无需参考文本", "No ref text"), &state.x_vector_only);
         }
 
         if (is_custom(selected)) {
@@ -979,7 +1477,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::InputText(tr(state.lang, "输出文件", "Output File"), state.output_path, sizeof(state.output_path));
         }
 
-        if (ImGui::CollapsingHeader(tr(state.lang, "高级参数", "Advanced"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader(tr(state.lang, "高级参数", "Advanced"))) {
             ImGui::SliderFloat(tr(state.lang, "温度", "Temperature"), &state.temperature, 0.0f, 2.0f, "%.2f");
             ImGui::SliderInt("Top-k", &state.top_k, 0, 200);
             ImGui::SliderFloat("Top-p", &state.top_p, 0.0f, 1.0f, "%.2f");
@@ -990,19 +1488,32 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (state.threads < 1) state.threads = 1;
         }
 
-        bool can_generate = state.models_ready && !state.generation_running;
-        if (!can_generate) ImGui::BeginDisabled();
-        if (ImGui::Button(state.generation_running ? tr(state.lang, "生成中...", "Generating...") : tr(state.lang, "开始生成", "Generate"), ImVec2(180, 42))) {
-            validate_or_set_popup(state, selected, state.save_output, state.output_path);
-            if (!state.request_validation_popup) {
-                state.generation_running = true;
-                state.generation_thread = std::thread([&state, selected]() {
-                    run_generation(state, selected);
-                    state.generation_running = false;
-                });
+        if (state.generation_running) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::Button(tr(state.lang, "终止", "Terminate"), ImVec2(180, 42))) {
+                state.cancel_requested = true;
             }
+            ImGui::PopStyleColor(3);
+        } else {
+            bool can_generate = state.models_ready && !state.generation_running;
+            if (!can_generate) ImGui::BeginDisabled();
+            if (ImGui::Button(tr(state.lang, "开始生成", "Generate"), ImVec2(180, 42))) {
+                state.cancel_requested = false;
+                state.segment_completed = 0;
+                state.progress_percent = 0;
+                validate_or_set_popup(state, selected, state.save_output, state.output_path);
+                if (!state.request_validation_popup) {
+                    state.generation_running = true;
+                    state.generation_thread = std::thread([&state, selected]() {
+                        run_generation(state, selected);
+                        state.generation_running = false;
+                    });
+                }
+            }
+            if (!can_generate) ImGui::EndDisabled();
         }
-        if (!can_generate) ImGui::EndDisabled();
 
         if (state.request_validation_popup) {
             ImGui::OpenPopup(tr(state.lang, "参数错误", "Parameter Error"));
@@ -1014,6 +1525,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
+        }
+
+        if (state.generation_running) {
+            float progress = (float)state.progress_percent / 100.0f;
+            if (state.segment_total <= 1) {
+                static float indeterminate = 0.0f;
+                indeterminate += ImGui::GetIO().DeltaTime * 0.5f;
+                if (indeterminate > 1.0f) indeterminate = 0.0f;
+                ImGui::ProgressBar(indeterminate, ImVec2(-1.0f, 0), "");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", tr(state.lang, "处理中...", "Processing..."));
+            } else {
+                char label[64];
+                snprintf(label, sizeof(label), "%s %d/%d",
+                    state.lang == ui_lang::zh ? "段" : "seg",
+                    (int)state.segment_completed, (int)state.segment_total);
+                ImGui::ProgressBar(progress, ImVec2(-1.0f, 0), label);
+                ImGui::SameLine();
+                ImGui::Text("%d%%", (int)state.progress_percent);
+            }
         }
 
         ImGui::SeparatorText(tr(state.lang, "日志", "Logs"));

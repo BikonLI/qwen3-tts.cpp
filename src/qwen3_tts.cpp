@@ -76,6 +76,7 @@ namespace qwen3_tts {
         bool has_error = false;
         std::string error_msg;
         int64_t next_chunk_id = 0;
+        std::atomic<bool> cancel_requested{false};
         std::thread worker;
     };
 
@@ -149,6 +150,14 @@ namespace qwen3_tts {
         }
         std::lock_guard<std::mutex> lock(impl_->mutex);
         return impl_->dropped_chunks;
+    }
+
+    void tts_stream_session::cancel() {
+        if (!impl_) {
+            return;
+        }
+        impl_->cancel_requested.store(true);
+        impl_->cv.notify_all();
     }
 
     static void stream_set_error(const std::shared_ptr<tts_stream_session::impl> &impl,
@@ -527,6 +536,7 @@ namespace qwen3_tts {
           transformer_(std::make_unique<TTSTransformer>()),
           audio_encoder_(std::make_unique<AudioTokenizerEncoder>()),
           audio_decoder_(std::make_unique<AudioTokenizerDecoder>()) {
+        transformer_->set_cancel_flag(&cancel_requested_);
     }
 
     Qwen3TTS::~Qwen3TTS() {
@@ -670,6 +680,7 @@ namespace qwen3_tts {
 
     tts_result Qwen3TTS::synthesize(const std::string &text, const tts_params &params) {
         tts_result result;
+        cancel_requested_.store(false);
 
         if (!models_loaded_) {
             result.error_msg = "Models not loaded";
@@ -692,6 +703,7 @@ namespace qwen3_tts {
         const std::string &text, const std::string &reference_audio, const tts_params &params
     ) {
         tts_result result;
+        cancel_requested_.store(false);
 
         if (params.task_type == tts_task_type::voice_clone &&
             !params.x_vector_only_mode &&
@@ -722,6 +734,7 @@ namespace qwen3_tts {
         const std::string &text, const float *ref_samples, int32_t n_ref_samples, const tts_params &params
     ) {
         tts_result result;
+        cancel_requested_.store(false);
 
         if (!models_loaded_) {
             result.error_msg = "Models not loaded";
@@ -772,6 +785,7 @@ namespace qwen3_tts {
     bool Qwen3TTS::extract_speaker_embedding(
         const float *ref_samples, int32_t n_ref_samples, std::vector<float> &embedding, const tts_params &params
     ) {
+        cancel_requested_.store(false);
         if (!models_loaded_) {
             error_msg_ = "Models not loaded";
             return false;
@@ -830,12 +844,18 @@ namespace qwen3_tts {
     tts_result Qwen3TTS::synthesize_internal(
         const std::string &text, const float *speaker_embedding, const tts_params &params, tts_result &result
     ) {
+        cancel_requested_.store(false);
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             if (stream_active_) {
                 result.error_msg = "Streaming session is active; concurrent non-stream synthesis is not supported";
                 return result;
             }
+        }
+
+        if (cancel_requested_.load()) {
+            result.error_msg = "generation cancelled";
+            return result;
         }
 
         if (loaded_model_variant_ != tts_model_variant::auto_variant &&
@@ -1011,7 +1031,16 @@ namespace qwen3_tts {
                 nullptr,
                 params.seed
             )) {
+            if (cancel_requested_.load()) {
+                result.error_msg = "generation cancelled";
+                return result;
+            }
             result.error_msg = "Failed to generate speech codes: " + transformer_->get_error();
+            return result;
+        }
+
+        if (cancel_requested_.load()) {
+            result.error_msg = "generation cancelled";
             return result;
         }
 
@@ -1116,11 +1145,29 @@ namespace qwen3_tts {
         progress_callback_ = callback;
     }
 
+    void Qwen3TTS::request_cancel() {
+        cancel_requested_.store(true);
+        std::shared_ptr<tts_stream_session::impl> stream_impl;
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_impl = stream_impl_;
+        }
+        if (stream_impl) {
+            stream_impl->cancel_requested.store(true);
+            stream_impl->cv.notify_all();
+        }
+    }
+
+    bool Qwen3TTS::is_cancelled() const {
+        return cancel_requested_.load();
+    }
+
     std::shared_ptr<tts_stream_session> Qwen3TTS::synthesize_stream(
         const std::string &text,
         const tts_stream_params &params,
         const tts_stream_callbacks &callbacks
     ) {
+        cancel_requested_.store(false);
         if (!models_loaded_) {
             error_msg_ = "Models not loaded";
             if (callbacks.on_error) {
@@ -1148,6 +1195,7 @@ namespace qwen3_tts {
         const tts_stream_params &params,
         const tts_stream_callbacks &callbacks
     ) {
+        cancel_requested_.store(false);
         if (params.tts.task_type == tts_task_type::voice_clone &&
             !params.tts.x_vector_only_mode &&
             params.tts.reference_text.empty()) {
@@ -1185,6 +1233,7 @@ namespace qwen3_tts {
         const tts_stream_params &params,
         const tts_stream_callbacks &callbacks
     ) {
+        cancel_requested_.store(false);
         if (!models_loaded_) {
             error_msg_ = "Models not loaded";
             if (callbacks.on_error) {
@@ -1246,6 +1295,7 @@ namespace qwen3_tts {
         const tts_stream_params &params,
         const tts_stream_callbacks &callbacks
     ) {
+        cancel_requested_.store(false);
         if (!models_loaded_) {
             error_msg_ = "Models not loaded";
             if (callbacks.on_error) {
@@ -1337,6 +1387,15 @@ namespace qwen3_tts {
                         }
                     }
                 };
+
+                auto is_cancelled = [&]() {
+                    return cancel_requested_.load() || impl->cancel_requested.load();
+                };
+
+                if (is_cancelled()) {
+                    report_error("cancelled");
+                    return;
+                }
 
                 tts_params p = params.tts;
 
@@ -1554,11 +1613,15 @@ namespace qwen3_tts {
                         {
                             std::unique_lock<std::mutex> lock(decode_mutex);
                             decode_cv.wait(lock, [&]() {
-                                return !decode_queue.empty() || decode_input_done || decode_failed.load();
+                                return !decode_queue.empty() || decode_input_done || decode_failed.load() || is_cancelled();
                             });
-                            if (decode_failed.load()) {
-                                return;
-                            }
+                        if (decode_failed.load()) {
+                            return;
+                        }
+                        if (is_cancelled()) {
+                            set_decode_error("cancelled");
+                            return;
+                        }
                             if (decode_queue.empty()) {
                                 if (decode_input_done) {
                                     break;
@@ -1707,7 +1770,7 @@ namespace qwen3_tts {
                     std::unique_lock<std::mutex> lock(decode_mutex);
                     const int64_t t_wait0_ms = get_time_ms();
                     decode_cv.wait(lock, [&]() {
-                        return decode_queue.size() < decode_work_capacity || decode_failed.load();
+                        return decode_queue.size() < decode_work_capacity || decode_failed.load() || is_cancelled();
                     });
                     const int64_t t_wait1_ms = get_time_ms();
                     if (t_wait1_ms > t_wait0_ms) {
@@ -1715,6 +1778,10 @@ namespace qwen3_tts {
                         n_enqueue_waits++;
                     }
                     if (decode_failed.load()) {
+                        return false;
+                    }
+                    if (is_cancelled()) {
+                        set_decode_error("cancelled");
                         return false;
                     }
 
@@ -1777,9 +1844,9 @@ namespace qwen3_tts {
                     instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                     (int32_t)instruct_tokens.size(),
                     [&](const int32_t *frame_codes, int32_t cb_count, int32_t frame_index) -> bool {
-                        if (decode_failed.load()) {
-                            return fail_from_decode_worker();
-                        }
+                    if (decode_failed.load()) {
+                        return fail_from_decode_worker();
+                    }
 
                         int64_t cb_t0_ms = get_time_ms();
                         if (cb_count != n_codebooks) {

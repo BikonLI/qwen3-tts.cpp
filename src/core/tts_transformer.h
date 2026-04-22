@@ -11,6 +11,7 @@
 #include <memory>
 #include <random>
 #include <functional>
+#include <atomic>
 #ifdef QWEN3_TTS_TIMING
 #include <chrono>
 #endif
@@ -297,6 +298,8 @@ public:
     // Configure backend thread count when supported by selected backend.
     // n_threads <= 0 keeps backend defaults.
     bool set_n_threads(int32_t n_threads);
+
+    void set_cancel_flag(const std::atomic<bool> *cancel_flag);
     
     const std::string & get_error() const { return error_msg_; }
     
@@ -367,6 +370,7 @@ private:
     std::vector<float> last_hidden_;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch_;
     std::mt19937 rng_{std::random_device{}()};
+    const std::atomic<bool> *cancel_flag_ = nullptr;
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;

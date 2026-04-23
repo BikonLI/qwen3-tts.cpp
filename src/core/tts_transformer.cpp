@@ -1087,7 +1087,8 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                                          int32_t speaker_codec_id,
                                          std::vector<float> & prefill_embd,
                                          std::vector<float> & trailing_text_hidden,
-                                         std::vector<float> & tts_pad_embed) {
+                                         std::vector<float> & tts_pad_embed,
+                                         bool non_streaming_mode) {
     if (!text_tokens) {
         error_msg_ = "text_tokens is null";
         return false;
@@ -1197,54 +1198,270 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         }
     }
 
-    std::vector<float> first_text_embed;
-    if (!project_text_tokens(text_tokens + 3, 1, first_text_embed)) {
+    const float * codec_pad_embed_ptr = codec_tail_embed.data();
+    const float * codec_bos_embed_ptr = codec_input_embedding.data() + (size_t)(codec_input_len - 1) * hidden_size;
+
+    int32_t assistant_prefill_len = 0;
+    std::vector<float> assistant_prefill_embd;
+
+    if (!non_streaming_mode) {
+        // Streaming mode: only first text token in prefill, rest goes to trailing_text_hidden
+        std::vector<float> first_text_embed;
+        if (!project_text_tokens(text_tokens + 3, 1, first_text_embed)) {
+            return false;
+        }
+
+        std::vector<float> first_text_plus_codec_bos(hidden_size);
+        for (int32_t h = 0; h < hidden_size; ++h) {
+            first_text_plus_codec_bos[h] = first_text_embed[h] + codec_bos_embed_ptr[h];
+        }
+
+        assistant_prefill_len = 3 + codec_plus_overlay_len + 1;
+        assistant_prefill_embd.resize((size_t)assistant_prefill_len * hidden_size);
+        memcpy(assistant_prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
+        memcpy(assistant_prefill_embd.data() + (size_t)3 * hidden_size,
+               codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
+        memcpy(assistant_prefill_embd.data() + (size_t)(assistant_prefill_len - 1) * hidden_size,
+               first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
+    } else {
+        // Non-streaming mode: prefill all remaining text tokens (matching Python input_id[:, 3:-5])
+        const int32_t remaining_text_count = std::max(0, n_tokens - 8);
+        std::vector<float> remaining_text_embed;
+        if (remaining_text_count > 0) {
+            if (!project_text_tokens(text_tokens + 3, remaining_text_count, remaining_text_embed)) {
+                return false;
+            }
+        }
+
+        // Build sequence: [remaining_text_embed] + [tts_eos_embed]
+        const int32_t text_seq_len = remaining_text_count + 1;
+        std::vector<float> text_seq_embd((size_t)text_seq_len * hidden_size);
+        if (remaining_text_count > 0) {
+            memcpy(text_seq_embd.data(), remaining_text_embed.data(), remaining_text_embed.size() * sizeof(float));
+        }
+        memcpy(text_seq_embd.data() + (size_t)remaining_text_count * hidden_size,
+               tts_eos_embed.data(), hidden_size * sizeof(float));
+
+        // Add codec_pad_embed to each token in the sequence (Python: + codec_pad overlay)
+        for (int32_t t = 0; t < text_seq_len; ++t) {
+            float * row = text_seq_embd.data() + (size_t)t * hidden_size;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                row[h] += codec_pad_embed_ptr[h];
+            }
+        }
+
+        // Build final pad+bos token (Python: tts_pad_embed + codec_bos_embed)
+        std::vector<float> pad_plus_bos(hidden_size);
+        for (int32_t h = 0; h < hidden_size; ++h) {
+            pad_plus_bos[h] = tts_pad_embed[h] + codec_bos_embed_ptr[h];
+        }
+
+        // Assemble: role_embed + codec_plus_overlay + text_seq_embd + pad_plus_bos
+        assistant_prefill_len = 3 + codec_plus_overlay_len + text_seq_len + 1;
+        assistant_prefill_embd.resize((size_t)assistant_prefill_len * hidden_size);
+        memcpy(assistant_prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
+        memcpy(assistant_prefill_embd.data() + (size_t)3 * hidden_size,
+               codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
+        memcpy(assistant_prefill_embd.data() + (size_t)(3 + codec_plus_overlay_len) * hidden_size,
+               text_seq_embd.data(), text_seq_embd.size() * sizeof(float));
+        memcpy(assistant_prefill_embd.data() + (size_t)(assistant_prefill_len - 1) * hidden_size,
+               pad_plus_bos.data(), hidden_size * sizeof(float));
+    }
+
+    if (instruct_tokens && n_instruct_tokens > 0) {
+        std::vector<float> instruct_embed;
+        if (!project_text_tokens(instruct_tokens, n_instruct_tokens, instruct_embed)) {
+            return false;
+        }
+
+        prefill_embd.resize((size_t)(n_instruct_tokens + assistant_prefill_len) * hidden_size);
+        memcpy(prefill_embd.data(), instruct_embed.data(), instruct_embed.size() * sizeof(float));
+        memcpy(prefill_embd.data() + (size_t)n_instruct_tokens * hidden_size,
+               assistant_prefill_embd.data(), assistant_prefill_embd.size() * sizeof(float));
+    } else {
+        prefill_embd = std::move(assistant_prefill_embd);
+    }
+
+    if (!non_streaming_mode) {
+        // Streaming mode: trailing_text_hidden contains remaining text
+        const int32_t trailing_token_count = std::max(0, n_tokens - 9);
+        std::vector<float> trailing_text_proj;
+        if (trailing_token_count > 0) {
+            if (!project_text_tokens(text_tokens + 4, trailing_token_count, trailing_text_proj)) {
+                return false;
+            }
+        }
+
+        const int32_t trailing_len = trailing_token_count + 1;
+        trailing_text_hidden.resize((size_t)trailing_len * hidden_size);
+        if (trailing_token_count > 0) {
+            memcpy(trailing_text_hidden.data(), trailing_text_proj.data(), trailing_text_proj.size() * sizeof(float));
+        }
+        memcpy(trailing_text_hidden.data() + (size_t)(trailing_len - 1) * hidden_size,
+               tts_eos_embed.data(), hidden_size * sizeof(float));
+    } else {
+        // Non-streaming mode: trailing_text_hidden is just tts_pad_embed (no incremental text)
+        trailing_text_hidden.resize((size_t)hidden_size);
+        memcpy(trailing_text_hidden.data(), tts_pad_embed.data(), hidden_size * sizeof(float));
+    }
+
+    return true;
+}
+
+bool TTSTransformer::build_icl_prefill(const int32_t * text_tokens, int32_t n_text_tokens,
+                                       const int32_t * ref_text_tokens, int32_t n_ref_text_tokens,
+                                       const int32_t * ref_codes, int32_t n_ref_code_frames,
+                                       const float * tts_pad_embed, const float * tts_eos_embed,
+                                       bool non_streaming_mode,
+                                       std::vector<float> & icl_prefill_embd,
+                                       std::vector<float> & icl_trailing_text_hidden) {
+    const auto & cfg = model_.config;
+    const int32_t hidden_size = cfg.hidden_size;
+
+    if (!text_tokens || n_text_tokens < 4 || !ref_text_tokens || n_ref_text_tokens < 4 ||
+        !ref_codes || n_ref_code_frames <= 0) {
+        error_msg_ = "Invalid ICL parameters";
         return false;
     }
 
-    std::vector<float> first_text_plus_codec_bos(hidden_size);
-    const float * codec_bos_embed = codec_input_embedding.data() + (size_t)(codec_input_len - 1) * hidden_size;
-    for (int32_t h = 0; h < hidden_size; ++h) {
-        first_text_plus_codec_bos[h] = first_text_embed[h] + codec_bos_embed[h];
+    // 1. text_embed = projection(embedding([ref_id, text_id])) + tts_eos_embed
+    // ref_id = ref_text_tokens[3:-2], text_id = text_tokens[3:-5]
+    const int32_t ref_content_len = std::max(0, n_ref_text_tokens - 5);   // 3:-2
+    const int32_t text_content_len = std::max(0, n_text_tokens - 8);      // 3:-5
+    const int32_t combined_text_len = ref_content_len + text_content_len + 1; // +1 for eos
+
+    std::vector<int32_t> combined_text_ids;
+    combined_text_ids.reserve(combined_text_len);
+    for (int i = 0; i < ref_content_len; ++i) {
+        combined_text_ids.push_back(ref_text_tokens[3 + i]);
+    }
+    for (int i = 0; i < text_content_len; ++i) {
+        combined_text_ids.push_back(text_tokens[3 + i]);
+    }
+    combined_text_ids.push_back(cfg.tts_eos_token_id);
+
+    std::vector<float> text_proj;
+    if (!project_text_tokens(combined_text_ids.data(), combined_text_len, text_proj)) {
+        return false;
     }
 
-        const int32_t assistant_prefill_len = 3 + codec_plus_overlay_len + 1;
-        std::vector<float> assistant_prefill_embd((size_t)assistant_prefill_len * hidden_size);
-        memcpy(assistant_prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
-        memcpy(assistant_prefill_embd.data() + (size_t)3 * hidden_size,
-            codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
-        memcpy(assistant_prefill_embd.data() + (size_t)(assistant_prefill_len - 1) * hidden_size,
-            first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
+    // Add tts_eos_embed to the last token
+    float * last_row = text_proj.data() + (size_t)(combined_text_len - 1) * hidden_size;
+    for (int32_t h = 0; h < hidden_size; ++h) {
+        last_row[h] += tts_eos_embed[h];
+    }
 
-        if (instruct_tokens && n_instruct_tokens > 0) {
-         std::vector<float> instruct_embed;
-         if (!project_text_tokens(instruct_tokens, n_instruct_tokens, instruct_embed)) {
-             return false;
-         }
-
-         prefill_embd.resize((size_t)(n_instruct_tokens + assistant_prefill_len) * hidden_size);
-         memcpy(prefill_embd.data(), instruct_embed.data(), instruct_embed.size() * sizeof(float));
-         memcpy(prefill_embd.data() + (size_t)n_instruct_tokens * hidden_size,
-             assistant_prefill_embd.data(), assistant_prefill_embd.size() * sizeof(float));
-        } else {
-         prefill_embd = std::move(assistant_prefill_embd);
+    // 2. codec_embed = sum of ref_code embeddings + codec_bos_embed
+    std::vector<float> codec_sum((size_t)n_ref_code_frames * hidden_size, 0.0f);
+    for (int frame = 0; frame < n_ref_code_frames; ++frame) {
+        float * frame_sum = codec_sum.data() + (size_t)frame * hidden_size;
+        for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+            int32_t code = ref_codes[frame * cfg.n_codebooks + cb];
+            std::vector<float> emb_row(hidden_size);
+            if (cb == 0) {
+                if (!lookup_single_embedding_row(model_.codec_embd, code, emb_row.data())) {
+                    return false;
+                }
+            } else {
+                if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, emb_row.data())) {
+                    return false;
+                }
+            }
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                frame_sum[h] += emb_row[h];
+            }
         }
+    }
 
-    const int32_t trailing_token_count = std::max(0, n_tokens - 9);
-    std::vector<float> trailing_text_proj;
-    if (trailing_token_count > 0) {
-        if (!project_text_tokens(text_tokens + 4, trailing_token_count, trailing_text_proj)) {
+    // Prepend codec_bos_embed
+    std::vector<float> codec_bos_embed(hidden_size);
+    if (!lookup_single_embedding_row(model_.codec_embd, cfg.codec_bos_id, codec_bos_embed.data())) {
+        return false;
+    }
+
+    const int32_t codec_len = n_ref_code_frames + 1;
+    std::vector<float> codec_embed((size_t)codec_len * hidden_size);
+    memcpy(codec_embed.data(), codec_bos_embed.data(), hidden_size * sizeof(float));
+    memcpy(codec_embed.data() + hidden_size, codec_sum.data(), codec_sum.size() * sizeof(float));
+
+    // 3. Combine based on non_streaming_mode
+    const int32_t text_len = combined_text_len;
+    if (non_streaming_mode) {
+        // text_embed + codec_pad overlay
+        std::vector<float> codec_pad_embed(hidden_size);
+        if (!lookup_single_embedding_row(model_.codec_embd, cfg.codec_pad_id, codec_pad_embed.data())) {
             return false;
         }
-    }
+        std::vector<float> text_with_pad((size_t)text_len * hidden_size);
+        memcpy(text_with_pad.data(), text_proj.data(), text_proj.size() * sizeof(float));
+        for (int t = 0; t < text_len; ++t) {
+            float * row = text_with_pad.data() + (size_t)t * hidden_size;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                row[h] += codec_pad_embed[h];
+            }
+        }
 
-    const int32_t trailing_len = trailing_token_count + 1;
-    trailing_text_hidden.resize((size_t)trailing_len * hidden_size);
-    if (trailing_token_count > 0) {
-        memcpy(trailing_text_hidden.data(), trailing_text_proj.data(), trailing_text_proj.size() * sizeof(float));
+        // codec_embed + tts_pad_embed overlay
+        std::vector<float> codec_with_pad((size_t)codec_len * hidden_size);
+        memcpy(codec_with_pad.data(), codec_embed.data(), codec_embed.size() * sizeof(float));
+        for (int t = 0; t < codec_len; ++t) {
+            float * row = codec_with_pad.data() + (size_t)t * hidden_size;
+            for (int32_t h = 0; h < hidden_size; ++h) {
+                row[h] += tts_pad_embed[h];
+            }
+        }
+
+        // Concatenate
+        icl_prefill_embd.resize((size_t)(text_len + codec_len) * hidden_size);
+        memcpy(icl_prefill_embd.data(), text_with_pad.data(), text_with_pad.size() * sizeof(float));
+        memcpy(icl_prefill_embd.data() + (size_t)text_len * hidden_size,
+               codec_with_pad.data(), codec_with_pad.size() * sizeof(float));
+
+        // trailing_text_hidden = tts_pad_embed
+        icl_trailing_text_hidden.resize((size_t)hidden_size);
+        memcpy(icl_trailing_text_hidden.data(), tts_pad_embed, hidden_size * sizeof(float));
+    } else {
+        // Streaming mode
+        if (text_len > codec_len) {
+            // text_embed[:, :codec_len] + codec_embed
+            icl_prefill_embd.resize((size_t)codec_len * hidden_size);
+            for (int t = 0; t < codec_len; ++t) {
+                float * out_row = icl_prefill_embd.data() + (size_t)t * hidden_size;
+                const float * text_row = text_proj.data() + (size_t)t * hidden_size;
+                const float * codec_row = codec_embed.data() + (size_t)t * hidden_size;
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    out_row[h] = text_row[h] + codec_row[h];
+                }
+            }
+            // trailing_text_hidden = text_embed[:, codec_len:]
+            const int32_t trailing_len = text_len - codec_len;
+            icl_trailing_text_hidden.resize((size_t)trailing_len * hidden_size);
+            memcpy(icl_trailing_text_hidden.data(),
+                   text_proj.data() + (size_t)codec_len * hidden_size,
+                   (size_t)trailing_len * hidden_size * sizeof(float));
+        } else {
+            // text_embed padded to codec_len + codec_embed
+            icl_prefill_embd.resize((size_t)codec_len * hidden_size);
+            for (int t = 0; t < text_len; ++t) {
+                float * out_row = icl_prefill_embd.data() + (size_t)t * hidden_size;
+                const float * text_row = text_proj.data() + (size_t)t * hidden_size;
+                const float * codec_row = codec_embed.data() + (size_t)t * hidden_size;
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    out_row[h] = text_row[h] + codec_row[h];
+                }
+            }
+            for (int t = text_len; t < codec_len; ++t) {
+                float * out_row = icl_prefill_embd.data() + (size_t)t * hidden_size;
+                const float * codec_row = codec_embed.data() + (size_t)t * hidden_size;
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    out_row[h] = tts_pad_embed[h] + codec_row[h];
+                }
+            }
+            // trailing_text_hidden = tts_pad_embed
+            icl_trailing_text_hidden.resize((size_t)hidden_size);
+            memcpy(icl_trailing_text_hidden.data(), tts_pad_embed, hidden_size * sizeof(float));
+        }
     }
-    memcpy(trailing_text_hidden.data() + (size_t)(trailing_len - 1) * hidden_size,
-           tts_eos_embed.data(), hidden_size * sizeof(float));
 
     return true;
 }
@@ -2526,7 +2743,8 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
 
 bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
                                                    std::vector<int32_t> & output,
-                                                   float temperature, int32_t top_k, float top_p) {
+                                                   float temperature, int32_t top_k, float top_p,
+                                                   bool dosample) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
@@ -2561,10 +2779,10 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     std::vector<float> logits_data(cfg.code_pred_vocab_size);
     
     std::vector<float> code_probs(cfg.code_pred_vocab_size);
-    
-    // Helper lambda: temperature + top-k sampling (or greedy if temperature <= 0)
+
+    // Helper lambda: temperature + top-k sampling (or greedy if dosample=false or temperature <= 0)
     auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
+        if (!dosample || temperature <= 0.0f) {
             return argmax(logits_ptr, vocab_size);
         }
         // Temperature scaling
@@ -2838,7 +3056,17 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                const int32_t * instruct_tokens,
                                int32_t n_instruct_tokens,
                                const generate_frame_callback_t & on_frame,
-                               int32_t seed) {
+                               int32_t seed,
+                               float subtalker_temperature,
+                               int32_t subtalker_top_k,
+                               float subtalker_top_p,
+                               bool subtalker_dosample,
+                               int32_t min_new_tokens,
+                               bool non_streaming_mode,
+                               const int32_t * ref_codes,
+                               int32_t n_ref_code_frames,
+                               const int32_t * ref_text_tokens,
+                               int32_t n_ref_text_tokens) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2882,9 +3110,33 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     if (!build_prefill_graph(text_tokens, n_tokens,
                              instruct_tokens, n_instruct_tokens,
                              speaker_embd, language_id, speaker_codec_id,
-                             prefill_embd, trailing_text_hidden, tts_pad_embed)) {
+                             prefill_embd, trailing_text_hidden, tts_pad_embed,
+                             non_streaming_mode)) {
         return false;
     }
+
+    // If ICL parameters provided, build ICL prefill and append to base prefill
+    if (ref_codes && n_ref_code_frames > 0 && ref_text_tokens && n_ref_text_tokens > 0) {
+        std::vector<float> icl_prefill_embd;
+        std::vector<float> icl_trailing_text_hidden;
+        const float * tts_eos_ptr = trailing_text_hidden.data() + (trailing_text_hidden.size() - (size_t)cfg.hidden_size);
+        if (!build_icl_prefill(text_tokens, n_tokens,
+                               ref_text_tokens, n_ref_text_tokens,
+                               ref_codes, n_ref_code_frames,
+                               tts_pad_embed.data(),
+                               tts_eos_ptr,
+                               non_streaming_mode,
+                               icl_prefill_embd, icl_trailing_text_hidden)) {
+            return false;
+        }
+        // Append ICL prefill to base prefill
+        size_t old_size = prefill_embd.size();
+        prefill_embd.resize(old_size + icl_prefill_embd.size());
+        memcpy(prefill_embd.data() + old_size, icl_prefill_embd.data(), icl_prefill_embd.size() * sizeof(float));
+        // Replace trailing_text_hidden with ICL trailing text
+        trailing_text_hidden = std::move(icl_trailing_text_hidden);
+    }
+
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     timing.t_prefill_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2892,7 +3144,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
-    const int32_t min_frames_before_eos = std::max(1, trailing_len);
+    const int32_t min_frames_before_eos = std::max(min_new_tokens, 1);
 
     const int32_t required_ctx = prefill_len + max_len + 8;
     if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
@@ -3045,7 +3297,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         t0 = clk::now();
 #endif
         std::vector<int32_t> codes_1_15;
-        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k, top_p)) {
+        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15,
+                                          subtalker_temperature, subtalker_top_k, subtalker_top_p,
+                                          subtalker_dosample)) {
             return false;
         }
 #ifdef QWEN3_TTS_TIMING

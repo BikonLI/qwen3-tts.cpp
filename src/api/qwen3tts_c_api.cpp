@@ -60,6 +60,12 @@ static qwen3_tts::tts_params to_cpp_params(const Qwen3TtsParams * p, int32_t def
         params.speaker = p->speaker ? p->speaker : "";
         params.reference_text = p->reference_text ? p->reference_text : "";
         params.x_vector_only_mode = p->x_vector_only_mode != 0;
+        params.subtalker_dosample = p->subtalker_dosample != 0;
+        params.subtalker_top_k = p->subtalker_top_k;
+        params.subtalker_top_p = p->subtalker_top_p;
+        params.subtalker_temperature = p->subtalker_temperature;
+        params.min_new_tokens = p->min_new_tokens;
+        params.non_streaming_mode = p->non_streaming_mode != 0;
     }
     return params;
 }
@@ -100,6 +106,12 @@ void qwen3_tts_default_params(Qwen3TtsParams * params) {
     params->speaker           = nullptr;
     params->reference_text    = nullptr;
     params->x_vector_only_mode = 0;
+    params->subtalker_dosample = 1;
+    params->subtalker_top_k   = 50;
+    params->subtalker_top_p   = 1.0f;
+    params->subtalker_temperature = 0.9f;
+    params->min_new_tokens    = 2;
+    params->non_streaming_mode = 0;
 }
 
 Qwen3Tts * qwen3_tts_create(const char * model_dir, int32_t n_threads) {

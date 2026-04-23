@@ -264,11 +264,12 @@ public:
     // hidden: hidden states from talker [hidden_size]
     // codebook_0_token: the codebook 0 token (used to create 2-token prefill input)
     // output: generated codes for codebooks 1-15 [15]
-    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token, 
+    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
                                        std::vector<int32_t> & output,
                                        float temperature = 0.9f,
                                        int32_t top_k = 50,
-                                       float top_p = 1.0f);
+                                       float top_p = 1.0f,
+                                       bool dosample = true);
     
     // Generate speech codes autoregressively
     // text_tokens: input text token IDs [n_tokens]
@@ -287,7 +288,17 @@ public:
                   const int32_t * instruct_tokens = nullptr,
                   int32_t n_instruct_tokens = 0,
                   const generate_frame_callback_t & on_frame = nullptr,
-                  int32_t seed = -1);
+                  int32_t seed = -1,
+                  float subtalker_temperature = 0.9f,
+                  int32_t subtalker_top_k = 50,
+                  float subtalker_top_p = 1.0f,
+                  bool subtalker_dosample = true,
+                  int32_t min_new_tokens = 2,
+                  bool non_streaming_mode = false,
+                  const int32_t * ref_codes = nullptr,
+                  int32_t n_ref_code_frames = 0,
+                  const int32_t * ref_text_tokens = nullptr,
+                  int32_t n_ref_text_tokens = 0);
     
     const tts_transformer_config & get_config() const { return model_.config; }
 
@@ -326,7 +337,16 @@ private:
                              int32_t speaker_codec_id,
                              std::vector<float> & prefill_embd,
                              std::vector<float> & trailing_text_hidden,
-                             std::vector<float> & tts_pad_embed);
+                             std::vector<float> & tts_pad_embed,
+                             bool non_streaming_mode = false);
+
+    bool build_icl_prefill(const int32_t * text_tokens, int32_t n_text_tokens,
+                           const int32_t * ref_text_tokens, int32_t n_ref_text_tokens,
+                           const int32_t * ref_codes, int32_t n_ref_code_frames,
+                           const float * tts_pad_embed, const float * tts_eos_embed,
+                           bool non_streaming_mode,
+                           std::vector<float> & icl_prefill_embd,
+                           std::vector<float> & icl_trailing_text_hidden);
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 

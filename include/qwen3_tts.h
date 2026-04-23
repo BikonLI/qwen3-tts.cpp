@@ -92,6 +92,40 @@ namespace qwen3_tts
         // Limit talker decode attention to the most recent N tokens.
         // 0 disables the limit (full attention over all past tokens).
         int32_t talker_attention_window = 0;
+
+        // === Subtalker (code predictor) sampling parameters ===
+        // When true, use sampling for code predictor; when false, use greedy (argmax).
+        bool subtalker_dosample = true;
+
+        // Top-k for code predictor sampling (0 = disabled)
+        int32_t subtalker_top_k = 50;
+
+        // Top-p for code predictor sampling
+        float subtalker_top_p = 1.0f;
+
+        // Temperature for code predictor sampling
+        float subtalker_temperature = 0.9f;
+
+        // Minimum number of talker frames to generate before allowing EOS.
+        // Python official hardcodes this to 2.
+        int32_t min_new_tokens = 2;
+
+        // When true, prefill all text embeddings at once (non-streaming mode).
+        // When false, trailing text is fed incrementally (streaming mode).
+        bool non_streaming_mode = false;
+
+        // === Voice Clone ICL mode parameters ===
+        // Reference audio codec codes for ICL (in-context learning) voice clone.
+        // Each frame has n_codebooks codes (typically 16). Row-major: [frame0_cb0, frame0_cb1, ..., frame1_cb0, ...]
+        // When non-empty and x_vector_only_mode=false, ICL mode is activated.
+        std::vector<int32_t> ref_codes;
+
+        // Number of frames in ref_codes. Must be ref_codes.size() / n_codebooks.
+        int32_t ref_code_frames = 0;
+
+        // Reference text token IDs for ICL prefill. Should be TTS-formatted text tokens.
+        // When empty, ref_text string is tokenized automatically.
+        std::vector<int32_t> ref_text_tokens;
     };
 
     // Common generation controls shared by all typed APIs below.

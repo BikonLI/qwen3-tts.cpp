@@ -971,6 +971,13 @@ namespace qwen3_tts {
             params.reference_text
         );
         std::vector<int32_t> instruct_tokens = tokenizer_->encode_instruct_for_tts(params.instruct);
+
+        // Prepare ICL ref_text_tokens if needed
+        std::vector<int32_t> ref_text_tokens = params.ref_text_tokens;
+        if (ref_text_tokens.empty() && !params.reference_text.empty() && !params.ref_codes.empty()) {
+            ref_text_tokens = tokenizer_->encode_for_tts(params.reference_text, "", params.speaker, "");
+        }
+
         result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
         sample_memory("synth/after-tokenize");
 
@@ -1026,16 +1033,27 @@ std::vector<int32_t> speech_codes;
             }
             return true;
         };
+        const bool use_icl = !params.ref_codes.empty() && !ref_text_tokens.empty();
         if (!transformer_->generate(
             text_tokens.data(), (int32_t)text_tokens.size(), generation_speaker_embedding,
             params.max_audio_tokens,
             speech_codes, effective_language_id, speaker_codec_id,
             params.repetition_penalty, params.temperature, params.top_k,
-                params.top_p,
+            params.top_p,
             instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
             (int32_t)instruct_tokens.size(),
             progress_callback_ ? synth_frame_cb : TTSTransformer::generate_frame_callback_t{},
-            params.seed
+            params.seed,
+            params.subtalker_temperature,
+            params.subtalker_top_k,
+            params.subtalker_top_p,
+            params.subtalker_dosample,
+            params.min_new_tokens,
+            params.non_streaming_mode,
+            use_icl ? params.ref_codes.data() : nullptr,
+            use_icl ? params.ref_code_frames : 0,
+            use_icl ? ref_text_tokens.data() : nullptr,
+            use_icl ? (int32_t)ref_text_tokens.size() : 0
         )) {
             if (cancel_requested_.load()) {
                 result.error_msg = "generation cancelled";
@@ -1056,8 +1074,25 @@ std::vector<int32_t> speech_codes;
         int n_codebooks = transformer_->get_config().n_codebooks;
         int n_frames = (int)speech_codes.size() / n_codebooks;
 
+        // ICL mode: prepend ref_codes to generated codes for decoding
+        int n_ref_frames = 0;
+        if (use_icl && !params.ref_codes.empty()) {
+            n_ref_frames = params.ref_code_frames;
+            if (n_ref_frames > 0) {
+                std::vector<int32_t> combined_codes;
+                combined_codes.reserve(params.ref_codes.size() + speech_codes.size());
+                combined_codes.insert(combined_codes.end(), params.ref_codes.begin(), params.ref_codes.end());
+                combined_codes.insert(combined_codes.end(), speech_codes.begin(), speech_codes.end());
+                speech_codes = std::move(combined_codes);
+                n_frames = (int)speech_codes.size() / n_codebooks;
+            }
+        }
+
         if (params.print_progress) {
-            fprintf(stderr, "Speech codes generated: %d frames x %d codebooks\n", n_frames, n_codebooks);
+            fprintf(stderr, "Speech codes generated: %d frames x %d codebooks (%s%d ref frames)\n",
+                    n_frames, n_codebooks,
+                    use_icl ? "" : "no ",
+                    n_ref_frames);
         }
 
         if (n_frames == 0) {
@@ -1105,6 +1140,19 @@ std::vector<int32_t> speech_codes;
         }
         result.t_decode_ms = get_time_ms() - t_decode_start;
         sample_memory("synth/after-decode");
+
+        // ICL mode: trim reference audio portion from decoded waveform
+        if (use_icl && n_ref_frames > 0 && n_frames > 0) {
+            int total_samples = (int)result.audio.size();
+            int cut_samples = (int)((double)n_ref_frames / (double)n_frames * total_samples);
+            if (cut_samples > 0 && cut_samples < total_samples) {
+                result.audio.erase(result.audio.begin(), result.audio.begin() + cut_samples);
+                if (params.print_progress) {
+                    fprintf(stderr, "ICL trim: removed %d reference samples (%.2f%%)\n",
+                            cut_samples, 100.0 * n_ref_frames / n_frames);
+                }
+            }
+        }
 
         if (low_mem_mode_) {
             audio_decoder_->unload_model();
@@ -1854,9 +1902,9 @@ std::vector<int32_t> speech_codes;
                     instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
                     (int32_t)instruct_tokens.size(),
                     [&](const int32_t *frame_codes, int32_t cb_count, int32_t frame_index) -> bool {
-                    if (decode_failed.load()) {
-                        return fail_from_decode_worker();
-                    }
+                        if (decode_failed.load()) {
+                            return fail_from_decode_worker();
+                        }
 
                         int64_t cb_t0_ms = get_time_ms();
                         if (cb_count != n_codebooks) {
@@ -1892,7 +1940,13 @@ std::vector<int32_t> speech_codes;
 
                         return true;
                     },
-                    p.seed
+                    p.seed,
+                    p.subtalker_temperature,
+                    p.subtalker_top_k,
+                    p.subtalker_top_p,
+                    p.subtalker_dosample,
+                    p.min_new_tokens,
+                    p.non_streaming_mode
                 );
 
                 if (!gen_ok) {

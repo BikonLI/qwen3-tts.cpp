@@ -29,6 +29,18 @@ typedef struct Qwen3TtsParams {
     const char* speaker;         /* optional */
     const char* reference_text;  /* required for base voice_clone unless x_vector_only_mode */
     int32_t x_vector_only_mode;  /* 0=false, 1=true */
+
+    /* Subtalker (code predictor) sampling parameters */
+    int32_t subtalker_dosample;  /* 0=false (greedy), 1=true (sampling), default: 1 */
+    int32_t subtalker_top_k;     /* default: 50, 0=disabled */
+    float   subtalker_top_p;     /* default: 1.0 */
+    float   subtalker_temperature; /* default: 0.9, 0=greedy */
+
+    /* Minimum talker frames before allowing EOS. Python hardcodes 2. */
+    int32_t min_new_tokens;      /* default: 2 */
+
+    /* Non-streaming mode: prefill all text at once. 0=false (streaming), 1=true */
+    int32_t non_streaming_mode;  /* 0=false, 1=true */
 } Qwen3TtsParams;
 
 /* Generated audio result */

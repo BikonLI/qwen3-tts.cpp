@@ -1763,7 +1763,11 @@ std::vector<int32_t> speech_codes;
                         }
                         cv.notify_all();
                         if (worker.joinable()) {
-                            worker.join();
+                            if (worker.get_id() == std::this_thread::get_id()) {
+                                worker.detach();
+                            } else {
+                                worker.join();
+                            }
                         }
                     }
                 } decode_guard{decode_mutex, decode_cv, decode_input_done, decode_worker};

@@ -1,5 +1,6 @@
 #include "gguf_loader.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -9,7 +10,7 @@ namespace qwen3_tts {
 namespace {
 struct shared_backend_state {
     ggml_backend_t backend = nullptr;
-    int32_t ref_count = 0;
+    std::atomic<int32_t> ref_count{0};
 };
 
 shared_backend_state & get_shared_backend_state() {
@@ -29,7 +30,7 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
 
     auto & shared = get_shared_backend_state();
     if (shared.backend) {
-        shared.ref_count++;
+        shared.ref_count.fetch_add(1, std::memory_order_relaxed);
         return shared.backend;
     }
 
@@ -51,7 +52,7 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
 
     if (backend) {
         shared.backend = backend;
-        shared.ref_count = 1;
+        shared.ref_count.store(1, std::memory_order_relaxed);
     }
 
     return backend;
@@ -64,11 +65,11 @@ void release_preferred_backend(ggml_backend_t backend) {
 
     auto & shared = get_shared_backend_state();
     if (shared.backend == backend) {
-        shared.ref_count--;
-        if (shared.ref_count <= 0) {
+        int32_t prev = shared.ref_count.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev <= 1) {
             ggml_backend_free(shared.backend);
             shared.backend = nullptr;
-            shared.ref_count = 0;
+            shared.ref_count.store(0, std::memory_order_relaxed);
         }
         return;
     }

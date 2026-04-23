@@ -1313,29 +1313,34 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
                              head_dim, GGML_ROPE_TYPE_NEOX, 0,
                              rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        
+
         struct ggml_tensor * k_cache = state_.cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.cache.v_cache[il];
-        
+        if (!k_cache || !v_cache) {
+            error_msg_ = "KV cache not initialized for layer " + std::to_string(il);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
         struct ggml_tensor * k_cache_view = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_tokens,
             k_cache->nb[1], k_cache->nb[2],
             n_past * k_cache->nb[2]);
-        
+
         struct ggml_tensor * v_cache_view = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_tokens,
             v_cache->nb[1], v_cache->nb[2],
             n_past * v_cache->nb[2]);
-        
+
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
-        
+
         int n_kv = n_past + n_tokens;
-        
+
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_kv,
             k_cache->nb[1], k_cache->nb[2], 0);
-        
+
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
@@ -1461,28 +1466,33 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past, int32_t at
         
         struct ggml_tensor * k_cache = state_.cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.cache.v_cache[il];
-        
+        if (!k_cache || !v_cache) {
+            error_msg_ = "KV cache not initialized for layer " + std::to_string(il);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
         struct ggml_tensor * k_cache_view = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_tokens,
             k_cache->nb[1], k_cache->nb[2],
             n_past * k_cache->nb[2]);
-        
+
         struct ggml_tensor * v_cache_view = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_tokens,
             v_cache->nb[1], v_cache->nb[2],
             n_past * v_cache->nb[2]);
-        
+
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
-        
+
         const int n_kv_total = n_past + n_tokens;
         const int n_kv = (attn_window > 0) ? std::min(n_kv_total, attn_window) : n_kv_total;
         const int kv_start = n_kv_total - n_kv;
-        
+
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_kv,
             k_cache->nb[1], k_cache->nb[2], kv_start * k_cache->nb[2]);
-        
+
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], kv_start * v_cache->nb[2]);
@@ -1759,12 +1769,17 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         
         struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
-        
+        if (!k_cache || !v_cache) {
+            error_msg_ = "Code predictor KV cache not initialized for layer " + std::to_string(il);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
         // Store at position 0 (prefill starts fresh)
         struct ggml_tensor * k_cache_view = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_tokens,
             k_cache->nb[1], k_cache->nb[2], 0);
-        
+
         struct ggml_tensor * v_cache_view = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_tokens,
             v_cache->nb[1], v_cache->nb[2], 0);
@@ -1914,26 +1929,31 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, 
         
         struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
-        
+        if (!k_cache || !v_cache) {
+            error_msg_ = "Code predictor KV cache not initialized for layer " + std::to_string(il);
+            ggml_free(ctx0);
+            return nullptr;
+        }
+
         struct ggml_tensor * k_cache_view = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_tokens,
             k_cache->nb[1], k_cache->nb[2],
             n_past * k_cache->nb[2]);
-        
+
         struct ggml_tensor * v_cache_view = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_tokens,
             v_cache->nb[1], v_cache->nb[2],
             n_past * v_cache->nb[2]);
-        
+
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
-        
+
         int n_kv = n_past + n_tokens;
-        
+
         struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
             head_dim, n_kv_head, n_kv,
             k_cache->nb[1], k_cache->nb[2], 0);
-        
+
         struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], 0);

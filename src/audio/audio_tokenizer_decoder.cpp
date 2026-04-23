@@ -52,27 +52,55 @@ void AudioTokenizerDecoder::unload_model() {
 void AudioTokenizerDecoder::normalize_codebooks() {
     const float epsilon = 1e-5f;
     
+    // Normalize a codebook using ggml_backend_tensor_get/set (works on all backends,
+    // not just CPU). Direct pointer access via t->data is unsafe for GPU/Metal tensors.
     auto normalize_codebook = [epsilon](struct ggml_tensor * codebook, struct ggml_tensor * usage, const char *) {
-        if (!codebook || !usage || !codebook->data || !usage->data) return;
+        if (!codebook || !usage) return;
         
         int64_t codebook_dim = codebook->ne[0];
         int64_t codebook_size = codebook->ne[1];
+        int64_t n_cb = codebook_dim * codebook_size;
+        int64_t n_usage = codebook_size;
         
-        ggml_fp16_t * cb_data = (ggml_fp16_t *)codebook->data;
-        float * usage_data = (float *)usage->data;
+        // Read codebook data to host (F16 → F32)
+        std::vector<float> cb_f32(n_cb);
+        if (codebook->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(codebook, cb_f32.data(), 0, n_cb * sizeof(float));
+        } else if (codebook->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> f16_buf(n_cb);
+            ggml_backend_tensor_get(codebook, f16_buf.data(), 0, n_cb * sizeof(ggml_fp16_t));
+            for (int64_t i = 0; i < n_cb; ++i) {
+                cb_f32[i] = ggml_fp16_to_fp32(f16_buf[i]);
+            }
+        } else {
+            return;
+        }
         
+        // Read usage data to host
+        std::vector<float> usage_data(n_usage);
+        ggml_backend_tensor_get(usage, usage_data.data(), 0, n_usage * sizeof(float));
+        
+        // Normalize: divide each embedding by its usage count
         for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
             float u = usage_data[emb_idx];
             if (u < epsilon) u = epsilon;
             float inv_u = 1.0f / u;
             
             for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
-                int64_t mem_idx = dim_idx + emb_idx * codebook_dim;
-                float val = ggml_fp16_to_fp32(cb_data[mem_idx]);
-                cb_data[mem_idx] = ggml_fp32_to_fp16(val * inv_u);
+                cb_f32[emb_idx * codebook_dim + dim_idx] *= inv_u;
             }
         }
         
+        // Write back normalized codebook (F32 → F16)
+        if (codebook->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> f16_out(n_cb);
+            for (int64_t i = 0; i < n_cb; ++i) {
+                f16_out[i] = ggml_fp32_to_fp16(cb_f32[i]);
+            }
+            ggml_backend_tensor_set(codebook, f16_out.data(), 0, n_cb * sizeof(ggml_fp16_t));
+        } else {
+            ggml_backend_tensor_set(codebook, cb_f32.data(), 0, n_cb * sizeof(float));
+        }
     };
     
     normalize_codebook(model_.vq_first_codebook, model_.vq_first_usage, "first");
@@ -340,16 +368,9 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     }
     
     normalize_codebooks();
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
-        }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
-    }
+    // Codebooks are normalized via ggml_backend_tensor_get/set round-trips,
+    // so they are already synced to the backend buffer. No additional upload needed.
+    // The old upload_if_present using t->data was unsafe for GPU/Metal backends.
     
     auto init_decoder_backend = [&]() -> bool {
         if (state_.sched) {

@@ -3107,18 +3107,22 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
     t0 = clk::now();
 #endif
-    if (!build_prefill_graph(text_tokens, n_tokens,
-                             instruct_tokens, n_instruct_tokens,
-                             speaker_embd, language_id, speaker_codec_id,
-                             prefill_embd, trailing_text_hidden, tts_pad_embed,
-                             non_streaming_mode)) {
-        return false;
-    }
+    const bool use_icl = (ref_codes && n_ref_code_frames > 0 && ref_text_tokens && n_ref_text_tokens > 0);
 
-    // If ICL parameters provided, build ICL prefill and append to base prefill
-    if (ref_codes && n_ref_code_frames > 0 && ref_text_tokens && n_ref_text_tokens > 0) {
+    if (use_icl) {
+        // ICL mode: build ICL prefill directly (includes ref_text + target_text + ref_codes)
+        // Do NOT call build_prefill_graph for target text alone to avoid duplication.
         std::vector<float> icl_prefill_embd;
         std::vector<float> icl_trailing_text_hidden;
+        // tts_pad_embed and tts_eos_embed are needed from base config; build a minimal prefill first
+        // to obtain tts_pad_embed and tts_eos_embed, then use them in ICL prefill.
+        if (!build_prefill_graph(text_tokens, n_tokens,
+                                 instruct_tokens, n_instruct_tokens,
+                                 speaker_embd, language_id, speaker_codec_id,
+                                 prefill_embd, trailing_text_hidden, tts_pad_embed,
+                                 non_streaming_mode)) {
+            return false;
+        }
         const float * tts_eos_ptr = trailing_text_hidden.data() + (trailing_text_hidden.size() - (size_t)cfg.hidden_size);
         if (!build_icl_prefill(text_tokens, n_tokens,
                                ref_text_tokens, n_ref_text_tokens,
@@ -3129,12 +3133,18 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                icl_prefill_embd, icl_trailing_text_hidden)) {
             return false;
         }
-        // Append ICL prefill to base prefill
-        size_t old_size = prefill_embd.size();
-        prefill_embd.resize(old_size + icl_prefill_embd.size());
-        memcpy(prefill_embd.data() + old_size, icl_prefill_embd.data(), icl_prefill_embd.size() * sizeof(float));
-        // Replace trailing_text_hidden with ICL trailing text
+        // Replace base prefill with ICL prefill (do NOT append)
+        prefill_embd = std::move(icl_prefill_embd);
         trailing_text_hidden = std::move(icl_trailing_text_hidden);
+    } else {
+        // Normal mode: build base prefill with target text only
+        if (!build_prefill_graph(text_tokens, n_tokens,
+                                 instruct_tokens, n_instruct_tokens,
+                                 speaker_embd, language_id, speaker_codec_id,
+                                 prefill_embd, trailing_text_hidden, tts_pad_embed,
+                                 non_streaming_mode)) {
+            return false;
+        }
     }
 
 #ifdef QWEN3_TTS_TIMING

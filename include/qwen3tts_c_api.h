@@ -41,6 +41,21 @@ typedef struct Qwen3TtsParams {
 
     /* Non-streaming mode: prefill all text at once. 0=false (streaming), 1=true */
     int32_t non_streaming_mode;  /* 0=false, 1=true */
+
+    /* Talker attention window. 0=full attention, >0=limit to N most recent tokens */
+    int32_t talker_attention_window; /* default: 0 */
+
+    /* ICL (voice clone) reference codec codes.
+     * When non-empty and x_vector_only_mode=0, ICL mode is activated.
+     * ref_codes: row-major [frame0_cb0, frame0_cb1, ..., frame1_cb0, ...]
+     * ref_code_frames: number of frames (must be ref_codes_count / n_codebooks)
+     * ref_text_tokens: optional pre-tokenized reference text token IDs
+     * ref_text_token_count: number of ref_text_tokens entries
+     */
+    const int32_t* ref_codes;
+    int32_t ref_code_frames;
+    const int32_t* ref_text_tokens;
+    int32_t ref_text_token_count;
 } Qwen3TtsParams;
 
 /* Generated audio result */
@@ -49,6 +64,13 @@ typedef struct Qwen3TtsAudio {
     int32_t n_samples;
     int32_t sample_rate;   /* always 24000 */
 } Qwen3TtsAudio;
+
+/* Encoded codec codes result */
+typedef struct Qwen3TtsCodes {
+    const int32_t* codes;  /* row-major: [frame0_cb0, frame0_cb1, ..., frame1_cb0, ...] */
+    int32_t n_frames;
+    int32_t n_codebooks;
+} Qwen3TtsCodes;
 
 /* Fill params with defaults */
 void qwen3_tts_default_params(Qwen3TtsParams* params);
@@ -119,6 +141,23 @@ Qwen3TtsAudio* qwen3_tts_synthesize_with_embedding(
     const float* embedding,
     int32_t embedding_size,
     const Qwen3TtsParams* params);
+
+/* Encode audio to discrete codec codes from WAV file.
+ * Returns NULL on failure. Caller must free with qwen3_tts_free_codes(). */
+Qwen3TtsCodes* qwen3_tts_encode_audio_file(
+    Qwen3Tts* tts,
+    const char* reference_audio_path);
+
+/* Encode audio to discrete codec codes from raw samples.
+ * ref_samples: 24kHz mono float32 normalized to [-1, 1].
+ * Returns NULL on failure. Caller must free with qwen3_tts_free_codes(). */
+Qwen3TtsCodes* qwen3_tts_encode_audio_samples(
+    Qwen3Tts* tts,
+    const float* ref_samples,
+    int32_t n_ref_samples);
+
+/* Free encoded codes */
+void qwen3_tts_free_codes(Qwen3TtsCodes* codes);
 
 /* Get last error message (or empty string) */
 const char* qwen3_tts_get_error(const Qwen3Tts* tts);

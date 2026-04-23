@@ -66,6 +66,17 @@ static qwen3_tts::tts_params to_cpp_params(const Qwen3TtsParams * p, int32_t def
         params.subtalker_temperature = p->subtalker_temperature;
         params.min_new_tokens = p->min_new_tokens;
         params.non_streaming_mode = p->non_streaming_mode != 0;
+        params.talker_attention_window = p->talker_attention_window;
+        // ICL (voice clone with ref_codes)
+        if (p->ref_codes && p->ref_code_frames > 0) {
+            params.ref_code_frames = p->ref_code_frames;
+            params.ref_codes.assign(p->ref_codes,
+                p->ref_codes + (size_t)p->ref_code_frames * 16 /* n_codebooks */);
+        }
+        if (p->ref_text_tokens && p->ref_text_token_count > 0) {
+            params.ref_text_tokens.assign(p->ref_text_tokens,
+                p->ref_text_tokens + p->ref_text_token_count);
+        }
     }
     return params;
 }
@@ -112,6 +123,11 @@ void qwen3_tts_default_params(Qwen3TtsParams * params) {
     params->subtalker_temperature = 0.9f;
     params->min_new_tokens    = 2;
     params->non_streaming_mode = 0;
+    params->talker_attention_window = 0;
+    params->ref_codes          = nullptr;
+    params->ref_code_frames    = 0;
+    params->ref_text_tokens    = nullptr;
+    params->ref_text_token_count = 0;
 }
 
 Qwen3Tts * qwen3_tts_create(const char * model_dir, int32_t n_threads) {
@@ -254,6 +270,56 @@ Qwen3TtsAudio * qwen3_tts_synthesize_with_embedding(
     auto * out = to_c_audio(result);
     AUTORELEASE_END
     return out;
+}
+
+Qwen3TtsCodes * qwen3_tts_encode_audio_file(
+        Qwen3Tts * tts, const char * reference_audio_path) {
+    if (!tts || !reference_audio_path) return nullptr;
+    AUTORELEASE_BEGIN
+    std::vector<int32_t> codes;
+    int32_t n_frames = 0;
+    int32_t n_codebooks = 0;
+    if (!tts->engine.encode_audio(reference_audio_path, codes, n_frames, n_codebooks)) {
+        tts->last_error = tts->engine.get_error();
+        AUTORELEASE_END
+        return nullptr;
+    }
+    auto * out = new Qwen3TtsCodes;
+    auto * buf = new int32_t[codes.size()];
+    std::memcpy(buf, codes.data(), codes.size() * sizeof(int32_t));
+    out->codes = buf;
+    out->n_frames = n_frames;
+    out->n_codebooks = n_codebooks;
+    AUTORELEASE_END
+    return out;
+}
+
+Qwen3TtsCodes * qwen3_tts_encode_audio_samples(
+        Qwen3Tts * tts, const float * ref_samples, int32_t n_ref_samples) {
+    if (!tts || !ref_samples || n_ref_samples <= 0) return nullptr;
+    AUTORELEASE_BEGIN
+    std::vector<int32_t> codes;
+    int32_t n_frames = 0;
+    int32_t n_codebooks = 0;
+    if (!tts->engine.encode_audio(ref_samples, n_ref_samples, codes, n_frames, n_codebooks)) {
+        tts->last_error = tts->engine.get_error();
+        AUTORELEASE_END
+        return nullptr;
+    }
+    auto * out = new Qwen3TtsCodes;
+    auto * buf = new int32_t[codes.size()];
+    std::memcpy(buf, codes.data(), codes.size() * sizeof(int32_t));
+    out->codes = buf;
+    out->n_frames = n_frames;
+    out->n_codebooks = n_codebooks;
+    AUTORELEASE_END
+    return out;
+}
+
+void qwen3_tts_free_codes(Qwen3TtsCodes * codes) {
+    if (!codes) return;
+    delete[] codes->codes;
+    delete codes;
 }
 
 const char * qwen3_tts_get_error(const Qwen3Tts * tts) {

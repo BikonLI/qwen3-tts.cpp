@@ -586,6 +586,7 @@ void print_usage(const char *program) {
     fprintf(stderr, "  -r, --reference <wav>             Reference audio for voice clone\n");
     fprintf(stderr, "  --ref-text <text|file>            Reference transcript for voice clone\n");
     fprintf(stderr, "  --x-vector-only                   Voice clone without reference_text\n");
+    fprintf(stderr, "  --encode-audio                    Encode reference audio to codec codes (output .codes.bin)\n");
     fprintf(stderr, "  --speaker <name>                  CustomVoice speaker\n");
     fprintf(stderr, "  --instruct <text|file>            Instruct text (CustomVoice/VoiceDesign)\n");
     fprintf(stderr, "  -l, --language <lang>             auto,en,ru,zh,ja,ko,de,fr,es,it,pt,beijing_dialect,sichuan_dialect\n");
@@ -669,6 +670,7 @@ int main(int argc, char **argv) {
     bool stream_parallel_decode = true;
     bool stream_drop_oldest_on_overflow = false;
     int32_t talker_attention_window = 0;
+    bool encode_audio_mode = false;
 
     qwen3_tts::tts_params params;
 
@@ -716,6 +718,8 @@ int main(int argc, char **argv) {
             reference_text = argv[i];
         } else if (arg == "--x-vector-only") {
             params.x_vector_only_mode = true;
+        } else if (arg == "--encode-audio") {
+            encode_audio_mode = true;
         } else if (arg == "--speaker") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing --speaker value\n");
@@ -979,6 +983,39 @@ int main(int argc, char **argv) {
         variant = infer_model_variant_from_path(model_path);
     }
     fprintf(stderr, "Loaded variant: %s\n", variant_name(variant));
+
+    if (encode_audio_mode) {
+        if (reference_audio.empty()) {
+            fprintf(stderr, "Error: --encode-audio requires --reference <wav>\n");
+            return 1;
+        }
+        std::vector<int32_t> codes;
+        int32_t n_frames = 0;
+        int32_t n_codebooks = 0;
+        fprintf(stderr, "Encoding audio: %s\n", reference_audio.c_str());
+        if (!tts.encode_audio(reference_audio, codes, n_frames, n_codebooks)) {
+            fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
+            return 1;
+        }
+        fprintf(stderr, "Encoded: %d frames x %d codebooks = %zu codes\n", n_frames, n_codebooks, codes.size());
+        std::string out_path = output_file.empty() ? (reference_audio + ".codes.bin") : output_file;
+        FILE *fout = nullptr;
+#ifdef _WIN32
+        fopen_s(&fout, out_path.c_str(), "wb");
+#else
+        fout = fopen(out_path.c_str(), "wb");
+#endif
+        if (!fout) {
+            fprintf(stderr, "Error: failed to open output file: %s\n", out_path.c_str());
+            return 1;
+        }
+        fwrite(&n_frames, sizeof(int32_t), 1, fout);
+        fwrite(&n_codebooks, sizeof(int32_t), 1, fout);
+        fwrite(codes.data(), sizeof(int32_t), codes.size(), fout);
+        fclose(fout);
+        fprintf(stderr, "Codes written to: %s\n", out_path.c_str());
+        return 0;
+    }
 
     if (stream_mode) {
         qwen3_tts::tts_stream_params stream_params;

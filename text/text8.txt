@@ -1,0 +1,20 @@
+今天天气不错，The sky is clear.
+我有3个apple，还有2.5个orange。
+请在2026-04-23 15:30提交报告。
+温度是27.5°C，风速12km/h。
+这个价格是$19.99，挺便宜的。
+Visit https://example.com now.
+邮箱是test_user123@gmail.com。
+CPU使用率达到99%，很高。
+他叫Tom，不是Tim。
+OK，我们开始吧！
+这个函数是f(x)=x^2+2x+1。
+电话是+1-800-123-4567。
+今天是星期五（Friday）。
+他说：“Hello, world!”然后离开。
+文件名是data_v2.1_final.txt。
+AI模型如GPT-5很强大。
+比例是1:3，不要搞错。
+请阅读第3章（Chapter 3）。
+她买了iPhone 15 Pro。
+Yes/No问题很简单，对吧？

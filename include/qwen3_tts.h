@@ -16,6 +16,7 @@ namespace qwen3_tts
     class TTSTransformer;
     class AudioTokenizerEncoder;
     class AudioTokenizerDecoder;
+    class AudioCodecEncoder;
 
     enum class tts_task_type
     {
@@ -348,6 +349,22 @@ namespace qwen3_tts
                                        std::vector<float> &embedding,
                                        const tts_params &params = tts_params());
 
+        // Encode audio to discrete codec codes (for ICL voice clone)
+        // ref_samples: 24kHz mono float32 normalized to [-1, 1]
+        // n_ref_samples: number of reference samples
+        // codes: output codes [n_frames * n_codebooks] as int32_t (row-major)
+        // n_frames: output number of frames
+        // n_codebooks: output number of codebooks (typically 16)
+        // Returns true on success
+        bool encode_audio(const float *ref_samples, int32_t n_ref_samples,
+                          std::vector<int32_t> &codes,
+                          int32_t &n_frames, int32_t &n_codebooks);
+
+        // Encode audio file to discrete codec codes (convenience overload)
+        bool encode_audio(const std::string &reference_audio,
+                          std::vector<int32_t> &codes,
+                          int32_t &n_frames, int32_t &n_codebooks);
+
         // Synthesize with pre-computed speaker embedding (skips encoder)
         // embedding: speaker embedding from extract_speaker_embedding()
         // embedding_size: must match hidden_size (typically 1024)
@@ -419,11 +436,13 @@ namespace qwen3_tts
         std::unique_ptr<TTSTransformer> transformer_;
         std::unique_ptr<AudioTokenizerEncoder> audio_encoder_;
         std::unique_ptr<AudioTokenizerDecoder> audio_decoder_;
+        std::unique_ptr<AudioCodecEncoder> codec_encoder_;
 
         bool models_loaded_ = false;
         bool encoder_loaded_ = false;
         bool transformer_loaded_ = false;
         bool decoder_loaded_ = false;
+        bool codec_encoder_loaded_ = false;
         bool low_mem_mode_ = false;
         tts_model_variant loaded_model_variant_ = tts_model_variant::auto_variant;
         int32_t loaded_hidden_size_ = 0;

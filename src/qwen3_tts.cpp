@@ -1,3 +1,4 @@
+#include "audio/audio_codec_encoder.h"
 #include "audio/audio_tokenizer_decoder.h"
 #include "audio/audio_tokenizer_encoder.h"
 #include "gguf_loader.h"
@@ -535,7 +536,8 @@ namespace qwen3_tts {
         : tokenizer_(std::make_unique<TextTokenizer>()),
           transformer_(std::make_unique<TTSTransformer>()),
           audio_encoder_(std::make_unique<AudioTokenizerEncoder>()),
-          audio_decoder_(std::make_unique<AudioTokenizerDecoder>()) {
+          audio_decoder_(std::make_unique<AudioTokenizerDecoder>()),
+          codec_encoder_(std::make_unique<AudioCodecEncoder>()) {
         transformer_->set_cancel_flag(&cancel_requested_);
     }
 
@@ -823,6 +825,61 @@ namespace qwen3_tts {
         return true;
     }
 
+    bool Qwen3TTS::encode_audio(
+        const float *ref_samples, int32_t n_ref_samples,
+        std::vector<int32_t> &codes,
+        int32_t &n_frames, int32_t &n_codebooks
+    ) {
+        cancel_requested_.store(false);
+        if (!models_loaded_) {
+            error_msg_ = "Models not loaded";
+            return false;
+        }
+
+        if (!codec_encoder_loaded_) {
+            if (decoder_model_path_.empty()) {
+                error_msg_ = "Internal error: missing tokenizer model path for codec encoder load";
+                return false;
+            }
+            int64_t t_load_start = get_time_ms();
+            if (!codec_encoder_->load_model(decoder_model_path_)) {
+                error_msg_ = "Failed to load codec encoder: " + codec_encoder_->get_error();
+                return false;
+            }
+            codec_encoder_loaded_ = true;
+            fprintf(stderr, "  Codec encoder loaded in %lld ms\n", (long long)(get_time_ms() - t_load_start));
+        }
+
+        if (!codec_encoder_->encode(ref_samples, n_ref_samples, codes, n_frames)) {
+            error_msg_ = "Failed to encode audio: " + codec_encoder_->get_error();
+            return false;
+        }
+
+        n_codebooks = codec_encoder_->get_config().n_codebooks;
+        return true;
+    }
+
+    bool Qwen3TTS::encode_audio(
+        const std::string &reference_audio,
+        std::vector<int32_t> &codes,
+        int32_t &n_frames, int32_t &n_codebooks
+    ) {
+        std::vector<float> ref_samples;
+        int ref_sample_rate;
+        if (!load_audio_file(reference_audio, ref_samples, ref_sample_rate)) {
+            error_msg_ = "Failed to load reference audio: " + reference_audio;
+            return false;
+        }
+        const int target_rate = 24000;
+        if (ref_sample_rate != target_rate) {
+            fprintf(stderr, "Resampling audio from %d Hz to %d Hz...\n", ref_sample_rate, target_rate);
+            std::vector<float> resampled;
+            resample_linear(ref_samples.data(), (int)ref_samples.size(), ref_sample_rate, resampled, target_rate);
+            ref_samples = std::move(resampled);
+        }
+        return encode_audio(ref_samples.data(), (int32_t)ref_samples.size(), codes, n_frames, n_codebooks);
+    }
+
     tts_result Qwen3TTS::synthesize_with_embedding(
         const std::string &text, const float *embedding, int32_t embedding_size, const tts_params &params
     ) {
@@ -1034,6 +1091,22 @@ std::vector<int32_t> speech_codes;
             return true;
         };
         const bool use_icl = !params.ref_codes.empty() && !ref_text_tokens.empty();
+
+        // Validate ICL ref_code_frames matches ref_codes size
+        if (use_icl && params.ref_code_frames > 0) {
+            const int n_codebooks = transformer_->get_config().n_codebooks;
+            const size_t expected_size = (size_t)params.ref_code_frames * (size_t)n_codebooks;
+            if (expected_size != params.ref_codes.size()) {
+                result.error_msg = std::string("ICL ref_code_frames (") +
+                                   std::to_string(params.ref_code_frames) +
+                                   ") * n_codebooks (" + std::to_string(n_codebooks) +
+                                   ") = " + std::to_string(expected_size) +
+                                   " does not match ref_codes.size() (" +
+                                   std::to_string(params.ref_codes.size()) + ")";
+                return result;
+            }
+        }
+
         if (!transformer_->generate(
             text_tokens.data(), (int32_t)text_tokens.size(), generation_speaker_embedding,
             params.max_audio_tokens,
@@ -1508,6 +1581,15 @@ std::vector<int32_t> speech_codes;
                     return;
                 }
 
+                // ICL (voice clone with ref_codes) is not supported in streaming mode.
+                // The official Python generate_voice_clone() is batch-based and always
+                // prepends ref_codes + trims after full decode. Streaming would require
+                // a fundamentally different architecture not present in the official impl.
+                if (!p.ref_codes.empty() && p.ref_code_frames > 0) {
+                    report_error("Voice clone ICL (ref_codes) is not supported in streaming mode. Use non-streaming synthesis for voice clone.");
+                    return;
+                }
+
                 int32_t effective_language_id = p.language_id;
                 int32_t speaker_codec_id = -1;
                 const bool use_custom_voice_speaker =
@@ -1537,6 +1619,7 @@ std::vector<int32_t> speech_codes;
                     p.reference_text
                 );
                 std::vector<int32_t> instruct_tokens = tokenizer_->encode_instruct_for_tts(p.instruct);
+
                 if (text_tokens.empty()) {
                     report_error("Failed to tokenize text");
                     return;
@@ -1946,7 +2029,11 @@ std::vector<int32_t> speech_codes;
                     p.subtalker_top_p,
                     p.subtalker_dosample,
                     p.min_new_tokens,
-                    p.non_streaming_mode
+                    p.non_streaming_mode,
+                    nullptr,  // Streaming does not support ICL ref_codes
+                    0,
+                    nullptr,
+                    0
                 );
 
                 if (!gen_ok) {

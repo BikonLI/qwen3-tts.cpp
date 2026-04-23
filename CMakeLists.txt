@@ -66,6 +66,7 @@ set(QWEN3TTS_SHARED_SOURCES
     src/core/tts_transformer.cpp
     src/audio/audio_tokenizer_encoder.cpp
     src/audio/audio_tokenizer_decoder.cpp
+    src/audio/audio_codec_encoder.cpp
     src/qwen3_tts.cpp
     src/api/qwen3tts_c_api.cpp
 )
@@ -138,6 +139,17 @@ if(WIN32)
         imgui
         Comdlg32
     )
+endif()
+
+# Test executable for text8 tokenization comparison
+add_executable(test_text8_tokenize
+    tests/test_text8_tokenize.cpp
+)
+target_link_libraries(test_text8_tokenize PRIVATE
+    qwen3tts_shared
+)
+if(MSVC)
+    target_compile_options(test_text8_tokenize PRIVATE /utf-8)
 endif()
 
 # Install targets

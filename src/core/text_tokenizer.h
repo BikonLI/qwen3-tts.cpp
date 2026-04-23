@@ -9,6 +9,9 @@
 
 namespace qwen3_tts {
 
+// Pre-tokenizer type
+enum class pre_tokenize_type { none = 0, qwen2 };
+
 // BPE tokenizer configuration
 struct tokenizer_config {
     int32_t vocab_size = 151936;
@@ -26,6 +29,17 @@ public:
     // Load tokenizer from GGUF file
     bool load_from_gguf(struct gguf_context * ctx);
     
+    // Pre-tokenize text using the configured pre-tokenizer (for testing/debugging)
+    // Returns empty vector if no pre-tokenizer is configured
+    std::vector<std::string> pre_tokenize(const std::string & text) const;
+
+    // Unicode property helpers (public for testing)
+    static bool is_unicode_letter(uint32_t cp);
+    static bool is_unicode_number(uint32_t cp);
+    static bool is_unicode_whitespace(uint32_t cp);
+    static bool is_unicode_newline(uint32_t cp);
+    static uint32_t decode_utf8_codepoint(const std::string & text, size_t pos, size_t & byte_len);
+
     // Encode text to token IDs
     std::vector<int32_t> encode(const std::string & text) const;
     
@@ -64,6 +78,7 @@ private:
     tokenizer_config config_;
     std::string error_msg_;
     bool loaded_ = false;
+    pre_tokenize_type pre_tokenize_type_ = pre_tokenize_type::none;
     
     // Vocabulary: token string -> token ID
     std::unordered_map<std::string, int32_t> vocab_;
@@ -95,6 +110,9 @@ private:
     // Find the pair with lowest rank in a sequence
     std::pair<std::string, std::string> get_min_pair(
         const std::vector<std::string> & word) const;
+
+    // Qwen2 regex pre-tokenizer
+    std::vector<std::string> pre_tokenize_qwen2(const std::string & text) const;
 };
 
 } // namespace qwen3_tts
